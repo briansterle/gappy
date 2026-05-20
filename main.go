@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,12 +15,13 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"gopkg.in/yaml.v3"
 )
 
-var jobs = runtime.NumCPU()
+var jobs int
 
 type HaulerManifest struct {
 	Spec struct {
@@ -33,6 +35,11 @@ type HaulerManifest struct {
 type ImageRef struct {
 	Source  string
 	Rewrite string
+}
+
+func init() {
+	flag.IntVar(&jobs, "j", max(1, runtime.NumCPU()-1), "parallel jobs")
+	flag.Parse()
 }
 
 func makeAuthOption() crane.Option {
@@ -81,6 +88,20 @@ func loadRefs(path string) ([]ImageRef, error) {
 	return refs, scanner.Err()
 }
 
+func pullWithRetry(ref string, authOpt crane.Option, attempts int) (v1.Image, error) {
+	var err error
+	for i := range attempts {
+		var img v1.Image
+		img, err = crane.Pull(ref, authOpt)
+		if err == nil {
+			return img, nil
+		}
+		log.Printf("pull attempt %d/%d failed %s: %v", i+1, attempts, ref, err)
+		time.Sleep(time.Duration(i+1) * 2 * time.Second)
+	}
+	return nil, err
+}
+
 func cmdPack(manifestPath string) {
 	refs, err := loadRefs(manifestPath)
 	if err != nil {
@@ -107,7 +128,7 @@ func cmdPack(manifestPath string) {
 			defer func() { <-sem }()
 
 			log.Printf("pulling %s", ref.Source)
-			img, err := crane.Pull(ref.Source, authOpt)
+			img, err := pullWithRetry(ref.Source, authOpt, 7)
 			if err != nil {
 				log.Printf("pull failed %s: %v", ref.Source, err)
 				return
@@ -176,25 +197,24 @@ func cmdServe(storePath string) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("usage:\n  gappy pack <images.txt|manifest.yaml>\n  gappy serve [store-path]")
+	args := flag.Args()
+	if len(args) < 1 {
+		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy serve [store-path]")
 	}
 
-	switch os.Args[1] {
+	switch args[0] {
 	case "pack":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			log.Fatal("usage: gappy pack <images.txt|manifest.yaml>")
 		}
-		cmdPack(os.Args[2])
-
+		cmdPack(args[1])
 	case "serve":
 		storePath := "./store"
-		if len(os.Args) >= 3 {
-			storePath = os.Args[2]
+		if len(args) >= 2 {
+			storePath = args[1]
 		}
 		cmdServe(storePath)
-
 	default:
-		log.Fatalf("unknown command %q — use pack or serve", os.Args[1])
+		log.Fatalf("unknown command %q — use pack or serve", args[0])
 	}
 }
