@@ -1,4 +1,4 @@
-module briansterle.com/gappy
+module github.com/briansterle/gappy
 
 go 1.26.3
 
