@@ -156,7 +156,15 @@ func cmdServe(storePath string) {
 		log.Fatalf("failed to load store: %v", err)
 	}
 
-	reg := registry.New(registry.WithReferrersSupport(false))
+	// Point the registry's storage directly at the OCI layout's blob folder
+	// The registry will recognize all existing blobs instantly.
+	blobsDir := fmt.Sprintf("%s/blobs", storePath)
+	log.Printf("serving blobs directly from %s", blobsDir)
+
+	reg := registry.New(
+		registry.WithReferrersSupport(false),
+		registry.WithBlobHandler(registry.NewDiskBlobHandler(blobsDir)),
+	)
 	addr := "127.0.0.1:5000"
 
 	server := &http.Server{Addr: addr, Handler: reg}
@@ -171,28 +179,46 @@ func cmdServe(storePath string) {
 		log.Fatal(err)
 	}
 
+	log.Printf("loading %d manifests into registry...", len(idxManifest.Manifests))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, jobs)
+
 	for _, desc := range idxManifest.Manifests {
-		ref := desc.Annotations["org.opencontainers.image.ref.name"]
-		if ref == "" {
-			log.Printf("skipping manifest with no ref annotation: %s", desc.Digest)
-			continue
-		}
+		wg.Add(1)
+		sem <- struct{}{}
 
-		img, err := idx.Image(desc.Digest)
-		if err != nil {
-			log.Printf("failed to load image %s: %v", ref, err)
-			continue
-		}
+		go func(d v1.Descriptor) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		dest := fmt.Sprintf("%s/%s", addr, ref)
-		if err := crane.Push(img, dest, crane.Insecure); err != nil {
-			log.Printf("failed to push %s into registry: %v", ref, err)
-			continue
-		}
-		log.Printf("loaded %s", ref)
+			ref := d.Annotations["org.opencontainers.image.ref.name"]
+			if ref == "" {
+				log.Printf("skipping manifest with no ref annotation: %s", d.Digest)
+				return
+			}
+
+			img, err := idx.Image(d.Digest)
+			if err != nil {
+				log.Printf("failed to load image %s: %v", ref, err)
+				return
+			}
+
+			dest := fmt.Sprintf("%s/%s", addr, ref)
+			
+			// Because the blobs already exist in the handler, crane.Push will detect 
+			// them and ONLY push the lightweight image manifests.
+			if err := crane.Push(img, dest, crane.Insecure); err != nil {
+				log.Printf("failed to push %s into registry: %v", ref, err)
+				return
+			}
+			log.Printf("loaded %s", ref)
+		}(desc)
 	}
 
+	wg.Wait()
 	log.Printf("registry ready on %s", addr)
+	
 	select {}
 }
 
