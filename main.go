@@ -37,6 +37,31 @@ type ImageRef struct {
 	Rewrite string
 }
 
+// layoutBlobHandler serves blobs directly from an OCI layout
+type layoutBlobHandler struct {
+	blobsDir string
+}
+
+func (h *layoutBlobHandler) Get(ctx context.Context, repo string, hash v1.Hash) (io.ReadCloser, error) {
+	path := filepath.Join(h.blobsDir, hash.Algorithm, hash.Hex)
+	return os.Open(path)
+}
+
+func (h *layoutBlobHandler) Stat(ctx context.Context, repo string, hash v1.Hash) (int64, error) {
+	path := filepath.Join(h.blobsDir, hash.Algorithm, hash.Hex)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// Put satisfies the registry interface, but we won't actually need it.
+func (h *layoutBlobHandler) Put(ctx context.Context, repo string, hash v1.Hash, rc io.ReadCloser) error {
+	defer rc.Close()
+	return nil
+}
+
 func init() {
 	flag.IntVar(&jobs, "j", max(1, runtime.NumCPU()-1), "parallel jobs")
 	flag.Parse()
@@ -159,11 +184,14 @@ func cmdServe(storePath string) {
 	// Point the registry's storage directly at the OCI layout's blob folder
 	// The registry will recognize all existing blobs instantly.
 	blobsDir := fmt.Sprintf("%s/blobs", storePath)
-	log.Printf("serving blobs directly from %s", blobsDir)
+	log.Printf("serving blobs explicitly from %s", blobsDir)
+
+	// Use our explicit OCI layout handler
+	handler := &layoutBlobHandler{blobsDir: blobsDir}
 
 	reg := registry.New(
 		registry.WithReferrersSupport(false),
-		registry.WithBlobHandler(registry.NewDiskBlobHandler(blobsDir)),
+		registry.WithBlobHandler(handler),
 	)
 	addr := "127.0.0.1:5000"
 
