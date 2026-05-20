@@ -2,6 +2,12 @@
 
 Simple but fast airgap tool. 
 
+### Install
+go will download source + build a static binary for your platform
+
+```bash
+go install github.com/briansterle/gappy@latest
+```
 
 ### API
 
