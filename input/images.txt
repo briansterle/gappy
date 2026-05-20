@@ -1,0 +1,15 @@
+ubuntu:24.04
+debian:bookworm-slim
+alpine:3.21
+nginx:alpine
+redis:alpine
+postgres:17-alpine
+golang:1.24-alpine
+python:3.13-alpine
+node:22-alpine
+busybox:latest
+registry.access.redhat.com/ubi9/ubi:latest
+registry.access.redhat.com/ubi9/ubi-minimal:latest
+registry.access.redhat.com/ubi9/ubi-micro:latest
+registry.access.redhat.com/ubi8/ubi:latest
+registry.access.redhat.com/ubi8/ubi-minimal:latest

@@ -1,0 +1,21 @@
+apiVersion: content.hauler.cattle.io/v1
+kind: Images
+metadata:
+  name: test-images
+spec:
+  images:
+    - name: ubuntu:24.04
+    - name: debian:bookworm-slim
+    - name: alpine:3.21
+    - name: nginx:alpine
+    - name: redis:alpine
+    - name: postgres:17-alpine
+    - name: golang:1.24-alpine
+    - name: python:3.13-alpine
+    - name: node:22-alpine
+    - name: busybox:latest
+    - name: registry.access.redhat.com/ubi9/ubi:latest
+    - name: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    - name: registry.access.redhat.com/ubi9/ubi-micro:latest
+    - name: registry.access.redhat.com/ubi8/ubi:latest
+    - name: registry.access.redhat.com/ubi8/ubi-minimal:latest
