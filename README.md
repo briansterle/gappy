@@ -24,4 +24,7 @@ gappy pack manifest.yaml
 
 # serve the registry at ./store on localhost:5000
 gappy serve 
+
+# build found-images.txt list by searching the current dir recursively
+gappy discover .
 ```
