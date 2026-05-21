@@ -5,22 +5,25 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"io"
 	"os"
-	"runtime"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -82,6 +85,18 @@ func makeAuthOption() crane.Option {
 	return crane.WithAuthFromKeychain(authn.DefaultKeychain)
 }
 
+func makeRemoteAuthOption() remote.Option {
+	user := os.Getenv("RSART_LOCAL_USER")
+	pass := os.Getenv("RSART_LOCAL_AUTH")
+	if user != "" && pass != "" {
+		return remote.WithAuth(authn.FromConfig(authn.AuthConfig{
+			Username: user,
+			Password: pass,
+		}))
+	}
+	return remote.WithAuthFromKeychain(authn.DefaultKeychain)
+}
+
 func loadRefs(path string) ([]ImageRef, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -137,13 +152,18 @@ func cmdPack(manifestPath string) {
 	}
 	log.Printf("loaded %d image refs", len(refs))
 
-	os.RemoveAll("./store")
-	lyt, err := layout.Write("./store", empty.Index)
+	var lyt layout.Path
+	if _, statErr := os.Stat("./store"); os.IsNotExist(statErr) {
+		lyt, err = layout.Write("./store", empty.Index)
+	} else {
+		lyt, err = layout.FromPath("./store")
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	authOpt := makeAuthOption()
+	craneAuthOpt := makeAuthOption()
+	remoteAuthOpt := makeRemoteAuthOption()
 	var mu sync.Mutex
 	sem := make(chan struct{}, jobs)
 	var wg sync.WaitGroup
@@ -155,22 +175,57 @@ func cmdPack(manifestPath string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			log.Printf("pulling %s", ref.Source)
-			img, err := pullWithRetry(ref.Source, authOpt, 7)
+			named, err := name.ParseReference(ref.Source)
 			if err != nil {
-				log.Printf("pull failed %s: %v", ref.Source, err)
+				log.Printf("failed to parse ref %s: %v", ref.Source, err)
 				return
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
-			if err := lyt.AppendImage(img, layout.WithAnnotations(map[string]string{
-				"org.opencontainers.image.ref.name": ref.Rewrite,
-			})); err != nil {
-				log.Printf("save failed %s: %v", ref.Source, err)
-			} else {
-				log.Printf("saved %s", ref.Rewrite)
+			desc, err := remote.Get(named, remoteAuthOpt)
+			if err != nil {
+				log.Printf("failed to fetch descriptor %s: %v", ref.Source, err)
+				return
 			}
+
+			blobPath := filepath.Join("./store", "blobs", desc.Digest.Algorithm, desc.Digest.Hex)
+			if _, err := os.Stat(blobPath); err == nil {
+				log.Printf("up-to-date, skipping %s (%s)", ref.Rewrite, desc.Digest)
+				return
+			}
+
+			log.Printf("pulling %s", ref.Source)
+
+			switch desc.MediaType {
+			case types.OCIImageIndex, types.DockerManifestList:
+				idx, err := desc.ImageIndex()
+				if err != nil {
+					log.Printf("pull failed %s: %v", ref.Source, err)
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if err := lyt.AppendIndex(idx, layout.WithAnnotations(map[string]string{
+					"org.opencontainers.image.ref.name": ref.Rewrite,
+				})); err != nil {
+					log.Printf("save failed %s: %v", ref.Source, err)
+					return
+				}
+			default:
+				img, err := pullWithRetry(ref.Source, craneAuthOpt, 7)
+				if err != nil {
+					log.Printf("pull failed %s: %v", ref.Source, err)
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if err := lyt.AppendImage(img, layout.WithAnnotations(map[string]string{
+					"org.opencontainers.image.ref.name": ref.Rewrite,
+				})); err != nil {
+					log.Printf("save failed %s: %v", ref.Source, err)
+					return
+				}
+			}
+			log.Printf("saved %s", ref.Rewrite)
 		}(ref)
 	}
 
@@ -236,8 +291,8 @@ func cmdServe(storePath string) {
 			}
 
 			dest := fmt.Sprintf("%s/%s", addr, ref)
-			
-			// Because the blobs already exist in the handler, crane.Push will detect 
+
+			// Because the blobs already exist in the handler, crane.Push will detect
 			// them and ONLY push the lightweight image manifests.
 			if err := crane.Push(img, dest, crane.Insecure); err != nil {
 				log.Printf("failed to push %s into registry: %v", ref, err)
@@ -249,7 +304,7 @@ func cmdServe(storePath string) {
 
 	wg.Wait()
 	log.Printf("registry ready on %s", addr)
-	
+
 	select {}
 }
 
