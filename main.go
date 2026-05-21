@@ -271,6 +271,12 @@ func main() {
 			storePath = args[1]
 		}
 		cmdServe(storePath)
+	case "discover":
+		root := "."
+		if len(args) >= 2 {
+			root = args[1]
+		}
+		cmdDiscover(root)
 	default:
 		log.Fatalf("unknown command %q — use pack or serve", args[0])
 	}
