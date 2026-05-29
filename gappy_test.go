@@ -45,26 +45,26 @@ func makeTestChart(t *testing.T, dir, name, version string) string {
 
 func TestResolveHelmAlias(t *testing.T) {
 	repos := []HelmRepository{
-		{Name: "rs-dev-helm", URL: "https://artifactory.example.com/helm/rs-dev-helm"},
-		{Name: "rs-dev-helm-oci", URL: "oci://artifactory.example.com/rs-dev-helm-oci"},
+		{Name: "my-helm-repo", URL: "https://charts.example.com/helm/my-helm-repo"},
+		{Name: "my-helm-repo-oci", URL: "oci://charts.example.com/my-helm-repo-oci"},
 	}
 
 	t.Run("resolves bare name", func(t *testing.T) {
-		r := resolveHelmAlias("rs-dev-helm", repos)
+		r := resolveHelmAlias("my-helm-repo", repos)
 		if r == nil || r.URL != repos[0].URL {
 			t.Fatalf("got %v, want %s", r, repos[0].URL)
 		}
 	})
 
 	t.Run("resolves @ prefix", func(t *testing.T) {
-		r := resolveHelmAlias("@rs-dev-helm", repos)
+		r := resolveHelmAlias("@my-helm-repo", repos)
 		if r == nil || r.URL != repos[0].URL {
 			t.Fatalf("got %v, want %s", r, repos[0].URL)
 		}
 	})
 
 	t.Run("resolves OCI repo", func(t *testing.T) {
-		r := resolveHelmAlias("@rs-dev-helm-oci", repos)
+		r := resolveHelmAlias("@my-helm-repo-oci", repos)
 		if r == nil || r.URL != repos[1].URL {
 			t.Fatalf("got %v, want %s", r, repos[1].URL)
 		}
@@ -81,8 +81,8 @@ func TestResolveHelmAlias(t *testing.T) {
 
 func TestLoadChartRefsFromHaulerWithRepos(t *testing.T) {
 	repos := []HelmRepository{
-		{Name: "rs-dev-helm", URL: "https://artifactory.example.com/helm/rs-dev-helm"},
-		{Name: "rs-dev-helm-oci", URL: "oci://artifactory.example.com/rs-dev-helm-oci"},
+		{Name: "my-helm-repo", URL: "https://charts.example.com/helm/my-helm-repo"},
+		{Name: "my-helm-repo-oci", URL: "oci://charts.example.com/my-helm-repo-oci"},
 	}
 
 	manifest := HaulerChartManifest{Kind: "Charts"}
@@ -91,8 +91,8 @@ func TestLoadChartRefsFromHaulerWithRepos(t *testing.T) {
 		Version string `yaml:"version"`
 		RepoURL string `yaml:"repoURL"`
 	}{
-		{Name: "activemq", Version: "6.1.6", RepoURL: "rs-dev-helm"},
-		{Name: "cert-manager", Version: "v1.14.0", RepoURL: "rs-dev-helm-oci"},
+		{Name: "my-chart", Version: "6.1.6", RepoURL: "my-helm-repo"},
+		{Name: "my-oci-chart", Version: "v1.14.0", RepoURL: "my-helm-repo-oci"},
 		{Name: "ghost-chart", Version: "1.0.0", RepoURL: "nonexistent"},
 	}
 
@@ -109,7 +109,7 @@ func TestLoadChartRefsFromHaulerWithRepos(t *testing.T) {
 		if r.Type != "http" {
 			t.Errorf("expected http, got %s", r.Type)
 		}
-		if r.Name != "activemq" || r.Version != "6.1.6" || r.RepoName != "rs-dev-helm" {
+		if r.Name != "my-chart" || r.Version != "6.1.6" || r.RepoName != "my-helm-repo" {
 			t.Errorf("unexpected ref: %+v", r)
 		}
 		if r.RepoURL != repos[0].URL {
@@ -122,7 +122,7 @@ func TestLoadChartRefsFromHaulerWithRepos(t *testing.T) {
 		if r.Type != "oci" {
 			t.Errorf("expected oci, got %s", r.Type)
 		}
-		if !strings.Contains(r.OciRef, "cert-manager:v1.14.0") {
+		if !strings.Contains(r.OciRef, "my-oci-chart:v1.14.0") {
 			t.Errorf("unexpected OciRef: %s", r.OciRef)
 		}
 		if strings.HasPrefix(r.OciRef, "oci://") {
@@ -135,7 +135,7 @@ func TestLoadChartRefsFromHaulerWithRepos(t *testing.T) {
 
 func TestHelmRepoHandler(t *testing.T) {
 	dir := t.TempDir()
-	makeTestChart(t, dir, "activemq", "6.1.6")
+	makeTestChart(t, dir, "my-chart", "6.1.6")
 	makeTestChart(t, dir, "redis", "7.0.0")
 
 	h := &helmRepoHandler{dir: dir}
@@ -152,8 +152,8 @@ func TestHelmRepoHandler(t *testing.T) {
 			t.Errorf("expected application/x-yaml, got %s", ct)
 		}
 		body := w.Body.String()
-		if !strings.Contains(body, "activemq") {
-			t.Error("index.yaml missing activemq")
+		if !strings.Contains(body, "my-chart") {
+			t.Error("index.yaml missing my-chart")
 		}
 		if !strings.Contains(body, "redis") {
 			t.Error("index.yaml missing redis")
@@ -161,7 +161,7 @@ func TestHelmRepoHandler(t *testing.T) {
 	})
 
 	t.Run("GET existing chart returns 200 with content", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/activemq-6.1.6.tgz", nil)
+		req := httptest.NewRequest(http.MethodGet, "/my-chart-6.1.6.tgz", nil)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
 
@@ -174,7 +174,7 @@ func TestHelmRepoHandler(t *testing.T) {
 	})
 
 	t.Run("GET chart with wrong version returns 404", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/activemq-0.0.0.tgz", nil)
+		req := httptest.NewRequest(http.MethodGet, "/my-chart-0.0.0.tgz", nil)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
 

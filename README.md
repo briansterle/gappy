@@ -94,12 +94,12 @@ metadata:
   name: my-charts
 spec:
   charts:
-    - name: activemq
-      version: 6.1.6-stig-increased-resources
-      repoURL: rs-dev-helm
-    - name: cert-manager
-      version: v1.14.0
-      repoURL: rs-dev-helm-oci
+    - name: my-chart
+      version: 1.2.3
+      repoURL: my-helm-repo
+    - name: my-oci-chart
+      version: 2.0.0
+      repoURL: my-helm-repo-oci
 ```
 
 `repoURL` is a Helm repo alias name. gappy resolves aliases via `~/.config/helm/repositories.yaml` — the same file Helm itself uses. HTTP repos are downloaded as `.tgz` files; OCI repos are pulled into the OCI layout.
@@ -107,8 +107,8 @@ spec:
 Authentication for both image registries and Helm repos uses the same credentials:
 
 ```bash
-export RSART_LOCAL_USER=myuser
-export RSART_LOCAL_AUTH=mypassword
+export GAPPY_USER=myuser
+export GAPPY_PASS=mypassword
 ```
 
 ### 4. Serve
@@ -129,8 +129,8 @@ A single server on `:5000` handles everything:
 Helm HTTP repos are auto-discovered from subdirectories of `./store/helm/` at startup. In the air gap:
 
 ```bash
-helm repo add rs-dev-helm http://localhost:5000/rs-dev-helm
-helm pull rs-dev-helm/activemq --version 6.1.6-stig-increased-resources
+helm repo add my-helm-repo http://localhost:5000/my-helm-repo
+helm pull my-helm-repo/my-chart --version 1.2.3
 ```
 
 ## Store layout
@@ -141,8 +141,8 @@ store/
 ├── index.json           OCI layout index
 ├── oci-layout
 └── helm/
-    └── rs-dev-helm/     HTTP Helm repo charts
-        ├── activemq-6.1.6-stig-increased-resources.tgz
+    └── my-helm-repo/    HTTP Helm repo charts
+        ├── my-chart-1.2.3.tgz
         └── ...
 ```
 

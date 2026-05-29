@@ -208,7 +208,7 @@ func findChartsInFile(path string, repos []HelmRepository) ([]string, error) {
 // tgzRepoName traces a pre-downloaded .tgz back to its Helm alias by reading
 // the parent Chart.yaml and matching the filename to a dependency entry.
 func tgzRepoName(tgzPath string, repos []HelmRepository) string {
-	// e.g. charts/infra/charts/activemq-6.1.6.tgz → charts/infra/Chart.yaml
+	// e.g. charts/myapp/charts/my-chart-1.2.3.tgz → charts/myapp/Chart.yaml
 	chartYaml := filepath.Join(filepath.Dir(filepath.Dir(tgzPath)), "Chart.yaml")
 	data, err := os.ReadFile(chartYaml)
 	if err != nil {

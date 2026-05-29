@@ -175,8 +175,8 @@ func init() {
 }
 
 func makeAuthOption() crane.Option {
-	user := os.Getenv("RSART_LOCAL_USER")
-	pass := os.Getenv("RSART_LOCAL_AUTH")
+	user := os.Getenv("GAPPY_USER")
+	pass := os.Getenv("GAPPY_PASS")
 	if user != "" && pass != "" {
 		return crane.WithAuth(authn.FromConfig(authn.AuthConfig{
 			Username: user,
@@ -187,8 +187,8 @@ func makeAuthOption() crane.Option {
 }
 
 func makeRemoteAuthOption() remote.Option {
-	user := os.Getenv("RSART_LOCAL_USER")
-	pass := os.Getenv("RSART_LOCAL_AUTH")
+	user := os.Getenv("GAPPY_USER")
+	pass := os.Getenv("GAPPY_PASS")
 	if user != "" && pass != "" {
 		return remote.WithAuth(authn.FromConfig(authn.AuthConfig{
 			Username: user,
@@ -613,7 +613,7 @@ func downloadChart(client *http.Client, url, destDir, destPath, chartName, versi
 		log.Printf("failed to build request for %s: %v", url, err)
 		return
 	}
-	if user, pass := os.Getenv("RSART_LOCAL_USER"), os.Getenv("RSART_LOCAL_AUTH"); user != "" && pass != "" {
+	if user, pass := os.Getenv("GAPPY_USER"), os.Getenv("GAPPY_PASS"); user != "" && pass != "" {
 		req.SetBasicAuth(user, pass)
 	}
 
