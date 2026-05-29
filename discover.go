@@ -14,9 +14,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func helmRegistry() string {
-	r := os.Getenv("RSART_HELM_REGISTRY")
-	return strings.TrimPrefix(strings.TrimSuffix(r, "/"), "oci://")
+type HelmRepositoriesFile struct {
+	Repositories []HelmRepository `yaml:"repositories"`
+}
+
+type HelmRepository struct {
+	Name string `yaml:"name"`
+	URL  string `yaml:"url"`
 }
 
 var imageRef = regexp.MustCompile(
@@ -42,11 +46,33 @@ type ChartFile struct {
 	} `yaml:"dependencies"`
 }
 
+func loadHelmRepos() []HelmRepository {
+	home, _ := os.UserHomeDir()
+	data, err := os.ReadFile(filepath.Join(home, ".config", "helm", "repositories.yaml"))
+	if err != nil {
+		return nil
+	}
+	var f HelmRepositoriesFile
+	yaml.Unmarshal(data, &f)
+	return f.Repositories
+}
+
+func resolveHelmAlias(alias string, repos []HelmRepository) *HelmRepository {
+	name := strings.TrimPrefix(alias, "@")
+	for i := range repos {
+		if repos[i].Name == name {
+			return &repos[i]
+		}
+	}
+	return nil
+}
+
 func cmdDiscover(root string) {
 	if root == "" {
 		root = "."
 	}
 
+	helmRepos := loadHelmRepos()
 	seen := map[string]bool{}
 	seenCharts := map[string]bool{}
 
@@ -62,7 +88,7 @@ func cmdDiscover(root string) {
 		}
 
 		if d.Name() == "Chart.yaml" {
-			charts, err := findChartsInFile(path)
+			charts, err := findChartsInFile(path, helmRepos)
 			if err != nil {
 				log.Printf("skipping %s: %v", path, err)
 			} else {
@@ -70,6 +96,13 @@ func cmdDiscover(root string) {
 					seenCharts[ref] = true
 				}
 			}
+		}
+
+		// Collect pre-downloaded .tgz chart files sitting in any charts/ subdirectory.
+		// These are the result of a prior `helm dep update` and are ready to copy directly.
+		if filepath.Ext(d.Name()) == ".tgz" && filepath.Base(filepath.Dir(path)) == "charts" {
+			repoName := tgzRepoName(path, helmRepos)
+			seenCharts[fmt.Sprintf("local::%s::%s", repoName, path)] = true
 		}
 
 		if !scanExts[strings.ToLower(filepath.Ext(d.Name()))] {
@@ -90,58 +123,45 @@ func cmdDiscover(root string) {
 		log.Printf("walk error: %v", err)
 	}
 
-	// write found-images.txt
-	refs := make([]string, 0, len(seen))
-	for ref := range seen {
-		refs = append(refs, ref)
-	}
-	sort.Strings(refs)
-
-	if len(refs) == 0 {
-		log.Println("no image references found")
-	} else {
-		out, err := os.Create("found-images.txt")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer out.Close()
-		w := bufio.NewWriter(out)
-		for _, ref := range refs {
-			fmt.Fprintln(w, ref)
-		}
-		if err := w.Flush(); err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("discovered %d unique image refs → found-images.txt", len(refs))
-	}
-
-	// write found-charts.txt
-	chartRefs := make([]string, 0, len(seenCharts))
-	for ref := range seenCharts {
-		chartRefs = append(chartRefs, ref)
-	}
-	sort.Strings(chartRefs)
-
-	if len(chartRefs) == 0 {
-		log.Println("no OCI chart references found")
-	} else {
-		out, err := os.Create("found-charts.txt")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer out.Close()
-		w := bufio.NewWriter(out)
-		for _, ref := range chartRefs {
-			fmt.Fprintln(w, ref)
-		}
-		if err := w.Flush(); err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("discovered %d unique chart refs → found-charts.txt", len(chartRefs))
-	}
+	writeFound("found-images.txt", seen, "image refs", "no image references found")
+	writeFound("found-charts.txt", seenCharts, "chart refs", "no chart references found")
 }
 
-func findChartsInFile(path string) ([]string, error) {
+func writeFound(path string, set map[string]bool, label, emptyMsg string) {
+	items := make([]string, 0, len(set))
+	for item := range set {
+		items = append(items, item)
+	}
+	sort.Strings(items)
+
+	if len(items) == 0 {
+		log.Println(emptyMsg)
+		return
+	}
+
+	out, err := os.Create(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer out.Close()
+	w := bufio.NewWriter(out)
+	for _, item := range items {
+		fmt.Fprintln(w, item)
+	}
+	if err := w.Flush(); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("discovered %d unique %s → %s", len(items), label, path)
+}
+
+// findChartsInFile parses a Chart.yaml and emits tagged lines for found-charts.txt:
+//
+//	oci::{full-oci-ref}
+//	http::{repoName}::{repoURL}::{chartName}::{version}
+//
+// It resolves @alias repos via ~/.config/helm/repositories.yaml and handles
+// bare oci:// and https:// URLs directly. file:// local deps are skipped.
+func findChartsInFile(path string, repos []HelmRepository) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -152,27 +172,62 @@ func findChartsInFile(path string) ([]string, error) {
 		return nil, err
 	}
 
-	registry := helmRegistry()
-
 	var refs []string
 	for _, dep := range chart.Dependencies {
 		repo := dep.Repository
 
-		if strings.HasPrefix(repo, "@") {
-			if registry == "" {
-				log.Printf("skipping %s — RSART_HELM_REGISTRY not set", dep.Name)
+		switch {
+		case strings.HasPrefix(repo, "oci://"):
+			base := strings.TrimPrefix(repo, "oci://")
+			refs = append(refs, fmt.Sprintf("oci::%s/%s:%s", base, dep.Name, dep.Version))
+
+		case strings.HasPrefix(repo, "@"):
+			r := resolveHelmAlias(repo, repos)
+			if r == nil {
+				log.Printf("skipping %s — alias %s not in ~/.config/helm/repositories.yaml", dep.Name, repo)
 				continue
 			}
-			repo = registry
-		} else if strings.HasPrefix(repo, "oci://") {
-			repo = strings.TrimPrefix(repo, "oci://")
-		} else {
-			continue
-		}
+			if strings.HasPrefix(r.URL, "oci://") {
+				base := strings.TrimPrefix(r.URL, "oci://")
+				refs = append(refs, fmt.Sprintf("oci::%s/%s:%s", base, dep.Name, dep.Version))
+			} else {
+				refs = append(refs, fmt.Sprintf("http::%s::%s::%s::%s", r.Name, r.URL, dep.Name, dep.Version))
+			}
 
-		refs = append(refs, fmt.Sprintf("%s/%s:%s", repo, dep.Name, dep.Version))
+		case strings.HasPrefix(repo, "https://") || strings.HasPrefix(repo, "http://"):
+			repoName := filepath.Base(strings.TrimSuffix(repo, "/"))
+			refs = append(refs, fmt.Sprintf("http::%s::%s::%s::%s", repoName, repo, dep.Name, dep.Version))
+
+		case strings.HasPrefix(repo, "file://"):
+			// local sub-chart reference — not a remote artifact to pack
+		}
 	}
 	return refs, nil
+}
+
+// tgzRepoName traces a pre-downloaded .tgz back to its Helm alias by reading
+// the parent Chart.yaml and matching the filename to a dependency entry.
+func tgzRepoName(tgzPath string, repos []HelmRepository) string {
+	// e.g. charts/infra/charts/activemq-6.1.6.tgz → charts/infra/Chart.yaml
+	chartYaml := filepath.Join(filepath.Dir(filepath.Dir(tgzPath)), "Chart.yaml")
+	data, err := os.ReadFile(chartYaml)
+	if err != nil {
+		return "local"
+	}
+	var chart ChartFile
+	yaml.Unmarshal(data, &chart)
+
+	base := filepath.Base(tgzPath)
+	for _, dep := range chart.Dependencies {
+		if base == fmt.Sprintf("%s-%s.tgz", dep.Name, dep.Version) {
+			if strings.HasPrefix(dep.Repository, "@") {
+				if r := resolveHelmAlias(dep.Repository, repos); r != nil {
+					return r.Name
+				}
+			}
+		}
+	}
+	return "local"
 }
 
 func findRefsInFile(path string) ([]string, error) {
