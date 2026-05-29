@@ -132,30 +132,42 @@ type helmRepoHandler struct {
 }
 
 func (h *helmRepoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p := r.URL.Path
+	p := strings.TrimPrefix(r.URL.Path, "/")
 	switch {
 	case p == "index.yaml":
-		data, err := buildHelmIndex(h.dir)
+		idx, err := buildHelmIndex(h.dir)
 		if err != nil {
+			log.Printf("helm index error %s: %v", h.dir, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		count, _ := helmIndexEntryCount(h.dir)
+		log.Printf("helm 200 GET index.yaml (%s, %d charts)", filepath.Base(h.dir), count)
 		w.Header().Set("Content-Type", "application/x-yaml")
-		w.Write(data)
+		w.Write(idx)
 
 	case strings.HasSuffix(p, ".tgz"):
-		f, err := os.Open(filepath.Join(h.dir, filepath.Base(p)))
+		name := filepath.Base(p)
+		f, err := os.Open(filepath.Join(h.dir, name))
 		if err != nil {
+			log.Printf("helm 404 GET %s/%s", filepath.Base(h.dir), name)
 			http.NotFound(w, r)
 			return
 		}
 		defer f.Close()
+		log.Printf("helm 200 GET %s/%s", filepath.Base(h.dir), name)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		io.Copy(w, f)
 
 	default:
+		log.Printf("helm 404 GET %s", r.URL.Path)
 		http.NotFound(w, r)
 	}
+}
+
+func helmIndexEntryCount(dir string) (int, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "*.tgz"))
+	return len(files), err
 }
 
 func init() {
@@ -226,7 +238,10 @@ func loadRefs(path string) ([]ImageRef, error) {
 }
 
 func loadChartRefsFromHauler(manifest HaulerChartManifest) []ChartRef {
-	repos := loadHelmRepos()
+	return loadChartRefsFromHaulerWithRepos(manifest, loadHelmRepos())
+}
+
+func loadChartRefsFromHaulerWithRepos(manifest HaulerChartManifest, repos []HelmRepository) []ChartRef {
 	var refs []ChartRef
 	for _, chart := range manifest.Spec.Charts {
 		r := resolveHelmAlias(chart.RepoURL, repos)
