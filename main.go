@@ -33,6 +33,13 @@ import (
 
 var jobs int
 
+// Set at build time via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 type HaulerManifest struct {
 	Spec struct {
 		Images []struct {
@@ -759,10 +766,18 @@ func cmdServe(storePath string) {
 	select {}
 }
 
+func cmdVersion() {
+	fmt.Printf("gappy %s\n", version)
+	fmt.Printf("  commit:  %s\n", commit)
+	fmt.Printf("  built:   %s\n", date)
+	fmt.Printf("  go:      %s\n", runtime.Version())
+	fmt.Printf("  os/arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
+}
+
 func main() {
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt>\n  gappy serve [store-path]\n  gappy discover [dir]")
+		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy serve [store-path]\n  gappy discover [dir]\n  gappy version")
 	}
 
 	switch args[0] {
@@ -773,7 +788,7 @@ func main() {
 		cmdPack(args[1])
 	case "pack-charts":
 		if len(args) < 2 {
-			log.Fatal("usage: gappy pack-charts <found-charts.txt>")
+			log.Fatal("usage: gappy pack-charts <found-charts.txt|manifest.yaml>")
 		}
 		cmdPackCharts(args[1])
 	case "serve":
@@ -788,7 +803,9 @@ func main() {
 			root = args[1]
 		}
 		cmdDiscover(root)
+	case "version":
+		cmdVersion()
 	default:
-		log.Fatalf("unknown command %q — use pack, pack-charts, serve, or discover", args[0])
+		log.Fatalf("unknown command %q — use pack, pack-charts, serve, discover, or version", args[0])
 	}
 }
