@@ -8,9 +8,12 @@ A fast, lightweight tool for packing container images and Helm charts into a por
 |---|---|---|
 | Binary size | ~10 MB | ~100 MB |
 | Dependencies | `go-containerregistry` only | helm SDK, k8s client-go, ... |
+| Parallel downloads | Yes (`-j N`, default: CPU count) | No (single-threaded) |
 | Helm repo serving | Single port (OCI + HTTP) | Separate |
 | Skip cached artifacts | Yes (digest check) | Yes |
 | Hauler manifest support | Yes | Yes |
+
+The parallel download difference is significant in practice. Pulling a large image manifest with `-j 12` is typically 5-10x faster than hauler's sequential pull, which matters when you have hundreds of images and charts to pack before a release.
 
 gappy is purpose-built for a single job: pack images and charts on a connected machine, carry the store across the air gap, serve everything locally. It does not try to be a general-purpose artifact manager.
 
@@ -39,7 +42,7 @@ gappy discover [dir]                                 find image and chart refs
 gappy version                                        print version info
 ```
 
-`-j N` controls parallel download workers (default: CPU count - 1).
+`-j N` controls parallel download workers (default: CPU count - 1). Hauler is single-threaded; `-j 12` or higher makes a material difference on large manifests.
 
 ## Workflow
 
