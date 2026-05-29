@@ -172,7 +172,6 @@ func helmIndexEntryCount(dir string) (int, error) {
 
 func init() {
 	flag.IntVar(&jobs, "j", max(1, runtime.NumCPU()-1), "parallel jobs")
-	flag.Parse()
 }
 
 func makeAuthOption() crane.Option {
@@ -790,6 +789,7 @@ func cmdVersion() {
 }
 
 func main() {
+	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
 		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy serve [store-path]\n  gappy discover [dir]\n  gappy version")
