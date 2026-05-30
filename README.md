@@ -13,7 +13,7 @@ A fast, lightweight tool for packing container images and Helm charts into a por
 | Skip cached artifacts | Yes (digest check) | Yes |
 | Hauler manifest support | Yes | Yes |
 
-The parallel download difference is significant in practice. Pulling a large image manifest with `-j 12` is typically 5-10x faster than hauler's sequential pull, which matters when you have hundreds of images and charts to pack before a release.
+The parallel download difference is significant in practice. Pulling a large image manifest with `-j 12` is typically 2-5x faster than hauler's sequential pull, which matters when you have hundreds of images and charts to pack before a release.
 
 gappy is purpose-built for a single job: pack images and charts on a connected machine, carry the store across the air gap, serve everything locally. It does not try to be a general-purpose artifact manager.
 
