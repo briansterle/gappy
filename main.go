@@ -417,6 +417,35 @@ func buildHelmIndex(dir string) ([]byte, error) {
 	return yaml.Marshal(idx)
 }
 
+// describable is the minimal surface shared by v1.Image and v1.ImageIndex
+// needed to build the OCI layout descriptor for the store's index.json.
+type describable interface {
+	MediaType() (types.MediaType, error)
+	Digest() (v1.Hash, error)
+	Size() (int64, error)
+}
+
+func descriptorFor(d describable, ref string) (v1.Descriptor, error) {
+	mt, err := d.MediaType()
+	if err != nil {
+		return v1.Descriptor{}, err
+	}
+	dig, err := d.Digest()
+	if err != nil {
+		return v1.Descriptor{}, err
+	}
+	sz, err := d.Size()
+	if err != nil {
+		return v1.Descriptor{}, err
+	}
+	return v1.Descriptor{
+		MediaType:   mt,
+		Size:        sz,
+		Digest:      dig,
+		Annotations: map[string]string{"org.opencontainers.image.ref.name": ref},
+	}, nil
+}
+
 func cmdPack(manifestPath string) {
 	refs, err := loadRefs(manifestPath)
 	if err != nil {
@@ -436,14 +465,22 @@ func cmdPack(manifestPath string) {
 
 	craneAuthOpt := makeAuthOption()
 	remoteAuthOpt := makeRemoteAuthOption()
-	var mu sync.Mutex
+
+	// Each worker downloads its blobs into the content-addressed store with NO
+	// lock — WriteImage/WriteIndex only write sha256-named blobs (temp file +
+	// atomic rename), which is safe to do concurrently. The only shared mutable
+	// state is index.json, so we collect descriptors into a per-ref slot (each
+	// goroutine owns results[i], no synchronization needed) and append them all
+	// to index.json serially after every download has finished. The slow,
+	// network-bound work runs fully parallel; nothing blocks on a lock.
+	results := make([]*v1.Descriptor, len(refs))
 	sem := make(chan struct{}, jobs)
 	var wg sync.WaitGroup
 
-	for _, ref := range refs {
+	for i, ref := range refs {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(ref ImageRef) {
+		go func(i int, ref ImageRef) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
@@ -467,6 +504,7 @@ func cmdPack(manifestPath string) {
 
 			log.Printf("pulling %s", ref.Source)
 
+			var artifact describable
 			switch desc.MediaType {
 			case types.OCIImageIndex, types.DockerManifestList:
 				idx, err := desc.ImageIndex()
@@ -474,34 +512,46 @@ func cmdPack(manifestPath string) {
 					log.Printf("pull failed %s: %v", ref.Source, err)
 					return
 				}
-				mu.Lock()
-				defer mu.Unlock()
-				if err := lyt.AppendIndex(idx, layout.WithAnnotations(map[string]string{
-					"org.opencontainers.image.ref.name": ref.Rewrite,
-				})); err != nil {
+				if err := lyt.WriteIndex(idx); err != nil {
 					log.Printf("save failed %s: %v", ref.Source, err)
 					return
 				}
+				artifact = idx
 			default:
 				img, err := pullWithRetry(ref.Source, craneAuthOpt, 7)
 				if err != nil {
 					log.Printf("pull failed %s: %v", ref.Source, err)
 					return
 				}
-				mu.Lock()
-				defer mu.Unlock()
-				if err := lyt.AppendImage(img, layout.WithAnnotations(map[string]string{
-					"org.opencontainers.image.ref.name": ref.Rewrite,
-				})); err != nil {
+				if err := lyt.WriteImage(img); err != nil {
 					log.Printf("save failed %s: %v", ref.Source, err)
 					return
 				}
+				artifact = img
 			}
+
+			d, err := descriptorFor(artifact, ref.Rewrite)
+			if err != nil {
+				log.Printf("save failed %s: %v", ref.Source, err)
+				return
+			}
+			results[i] = &d
 			log.Printf("saved %s", ref.Rewrite)
-		}(ref)
+		}(i, ref)
 	}
 
 	wg.Wait()
+
+	// Serial index.json assembly — cheap metadata writes, off the hot path.
+	for _, d := range results {
+		if d == nil {
+			continue
+		}
+		if err := lyt.AppendDescriptor(*d); err != nil {
+			log.Printf("index update failed for %s: %v", d.Annotations["org.opencontainers.image.ref.name"], err)
+		}
+	}
+
 	log.Println("store ready at ./store")
 }
 
