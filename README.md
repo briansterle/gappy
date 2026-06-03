@@ -136,6 +136,17 @@ helm repo add my-helm-repo http://localhost:5000/my-helm-repo
 helm pull my-helm-repo/my-chart --version 1.2.3
 ```
 
+### Pushing into the registry
+
+The `/v2/` endpoint accepts `docker push`, so you can add images to a running store from inside the air gap:
+
+```bash
+docker tag myapp:v1 localhost:5000/myapp:v1
+docker push localhost:5000/myapp:v1
+```
+
+Pushed blobs and manifests are written straight into the OCI layout (`blobs/` + `index.json`), so they persist across restarts and travel with the store — a pushed image is indistinguishable from a packed one. Single-arch images and multi-arch indexes are both supported. The registry serves plain HTTP on `localhost`, which Docker treats as insecure by default; no extra daemon config is needed.
+
 ## Store layout
 
 ```

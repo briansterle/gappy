@@ -3,10 +3,12 @@ package main
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -26,6 +29,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/match"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"gopkg.in/yaml.v3"
@@ -106,23 +110,173 @@ type layoutBlobHandler struct {
 	blobsDir string
 }
 
+// blobNotFound bridges a missing blob to the registry's internal "not found"
+// sentinel (an unexported errors.New("not found")), so HEAD/GET on an absent
+// blob returns 404 instead of 500. The registry matches it with errors.Is,
+// which consults this Is method. Docker push depends on this: the client HEADs
+// every blob before uploading and treats anything but 404 as a fatal error.
+type blobNotFound struct{ err error }
+
+func (e blobNotFound) Error() string      { return "not found: " + e.err.Error() }
+func (e blobNotFound) Unwrap() error      { return e.err }
+func (blobNotFound) Is(target error) bool { return target != nil && target.Error() == "not found" }
+
 func (h *layoutBlobHandler) Get(ctx context.Context, repo string, hash v1.Hash) (io.ReadCloser, error) {
 	path := filepath.Join(h.blobsDir, hash.Algorithm, hash.Hex)
-	return os.Open(path)
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, blobNotFound{err}
+	}
+	return f, err
 }
 
 func (h *layoutBlobHandler) Stat(ctx context.Context, repo string, hash v1.Hash) (int64, error) {
 	path := filepath.Join(h.blobsDir, hash.Algorithm, hash.Hex)
 	fi, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, blobNotFound{err}
+	}
 	if err != nil {
 		return 0, err
 	}
 	return fi.Size(), nil
 }
 
+// Put persists an uploaded blob into the content-addressed store so that
+// `docker push localhost:5000/...` actually keeps its layers and config. The
+// registry passes rc wrapped in a digest+size verifier, so io.Copy returns a
+// verification error on mismatch, which the registry maps to the right response.
 func (h *layoutBlobHandler) Put(ctx context.Context, repo string, hash v1.Hash, rc io.ReadCloser) error {
 	defer rc.Close()
-	return nil
+	dir := filepath.Join(h.blobsDir, hash.Algorithm)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	// Temp file in the same dir keeps the rename atomic and on one device.
+	tmp, err := os.CreateTemp(dir, "upload-*")
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(tmp, rc); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, hash.Hex))
+}
+
+// storeWriter wraps the registry handler so images pushed with
+// `docker push localhost:5000/...` are persisted into the OCI layout and survive
+// a serve restart, becoming part of the portable store. Pushed blobs are already
+// written by layoutBlobHandler.Put; here we additionally write each pushed
+// manifest blob into the layout and, for tag pushes, add (or replace) a
+// top-level descriptor in index.json.
+//
+// ready gates persistence: cmdServe replays the existing store into the
+// in-process registry on startup, and those internal pushes flow through this
+// same handler. They are already in the store, so persistence stays off until
+// the replay finishes and only genuine client pushes are recorded.
+type storeWriter struct {
+	inner http.Handler
+	lyt   layout.Path
+	ready atomic.Bool
+	mu    sync.Mutex
+}
+
+func (s *storeWriter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	repo, ref, ok := parseManifestPush(r)
+	if !ok || !s.ready.Load() {
+		s.inner.ServeHTTP(w, r)
+		return
+	}
+
+	// Buffer the manifest so we can persist it after the registry accepts it.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	contentType := r.Header.Get("Content-Type")
+
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	s.inner.ServeHTTP(rec, r)
+	if rec.status < 200 || rec.status >= 300 {
+		return
+	}
+
+	if err := s.persist(repo, ref, contentType, body); err != nil {
+		log.Printf("pushed %s:%s but failed to persist into store: %v", repo, ref, err)
+		return
+	}
+	log.Printf("persisted pushed %s:%s into store", repo, ref)
+}
+
+// persist writes the manifest blob into the layout and, for tag pushes, records
+// a top-level descriptor in index.json. Child manifests pushed by digest are
+// referenced by their parent index, so they only need their blob on disk.
+func (s *storeWriter) persist(repo, ref, contentType string, body []byte) error {
+	hash, _, err := v1.SHA256(bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.lyt.WriteBlob(hash, io.NopCloser(bytes.NewReader(body))); err != nil {
+		return err
+	}
+
+	if _, err := v1.NewHash(ref); err == nil {
+		return nil // pushed by digest — a child manifest, no index entry needed
+	}
+
+	refName := repo + ":" + ref
+	desc := v1.Descriptor{
+		MediaType:   types.MediaType(contentType),
+		Size:        int64(len(body)),
+		Digest:      hash,
+		Annotations: map[string]string{"org.opencontainers.image.ref.name": refName},
+	}
+	// Replace any existing descriptor for this tag so re-pushing updates in place.
+	if err := s.lyt.RemoveDescriptors(match.Name(refName)); err != nil {
+		return err
+	}
+	return s.lyt.AppendDescriptor(desc)
+}
+
+// statusRecorder captures the response status so storeWriter only persists a
+// manifest after the registry has accepted it.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if !r.wroteHeader {
+		r.status = code
+		r.wroteHeader = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// parseManifestPush reports whether r is a manifest PUT and returns the repo and
+// tag/digest reference. Path form: /v2/{repo...}/manifests/{ref}.
+func parseManifestPush(r *http.Request) (repo, ref string, ok bool) {
+	if r.Method != http.MethodPut {
+		return "", "", false
+	}
+	elem := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(elem) < 4 || elem[0] != "v2" || elem[len(elem)-2] != "manifests" {
+		return "", "", false
+	}
+	return strings.Join(elem[1:len(elem)-2], "/"), elem[len(elem)-1], true
 }
 
 // helmRepoHandler serves a Helm HTTP repository from a local directory.
@@ -723,7 +877,11 @@ func copyChart(src, destDir, destPath string) {
 }
 
 func cmdServe(storePath string) {
-	idx, err := layout.ImageIndexFromPath(storePath)
+	lyt, err := layout.FromPath(storePath)
+	if err != nil {
+		log.Fatalf("failed to load store: %v", err)
+	}
+	idx, err := lyt.ImageIndex()
 	if err != nil {
 		log.Fatalf("failed to load store: %v", err)
 	}
@@ -738,8 +896,12 @@ func cmdServe(storePath string) {
 		registry.WithBlobHandler(handler),
 	)
 
+	// storeWriter persists `docker push` uploads into the layout. It stays in
+	// pass-through mode until the startup replay below finishes (see ready).
+	sw := &storeWriter{inner: reg, lyt: lyt}
+
 	mux := http.NewServeMux()
-	mux.Handle("/v2/", reg)
+	mux.Handle("/v2/", sw)
 
 	// Register one Helm HTTP repo handler per subdirectory of ./store/helm/.
 	// Each repo is served at /{repoName}/ so clients can point their helm repo
@@ -825,7 +987,10 @@ func cmdServe(storePath string) {
 	}
 
 	wg.Wait()
-	log.Printf("registry ready on %s", addr)
+
+	// Replay finished: start recording genuine client pushes into the store.
+	sw.ready.Store(true)
+	log.Printf("registry ready on %s — accepting docker push", addr)
 
 	select {}
 }
