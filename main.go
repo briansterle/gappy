@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,7 +36,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var jobs int
+var (
+	jobs    int
+	webAddr string
+)
 
 var (
 	version = "v0.1.0"
@@ -325,6 +329,7 @@ func helmIndexEntryCount(dir string) (int, error) {
 
 func init() {
 	flag.IntVar(&jobs, "j", max(1, runtime.NumCPU()-1), "parallel jobs")
+	flag.StringVar(&webAddr, "web", "", "gappy web address to stream pack progress to (e.g. http://127.0.0.1:8080)")
 }
 
 func makeAuthOption() crane.Option {
@@ -599,7 +604,62 @@ func descriptorFor(d describable, ref string) (v1.Descriptor, error) {
 	}, nil
 }
 
-func cmdPack(manifestPath string) {
+// cliReporter streams pack progress from the CLI to a running gappy web server
+// so the browser transit visualization works for CLI-initiated packs.
+type cliReporter struct {
+	addr   string
+	jobID  string
+	client *http.Client
+}
+
+func newCLIReporter(addr string) *cliReporter {
+	if addr == "" {
+		return nil
+	}
+	return &cliReporter{addr: strings.TrimRight(addr, "/"), client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+// register sends the initial job metadata and returns the browser watch URL.
+func (r *cliReporter) register(jobData map[string]any) (string, error) {
+	b, err := json.Marshal(jobData)
+	if err != nil {
+		return "", err
+	}
+	resp, err := r.client.Post(r.addr+"/api/cli/start", "application/json", bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var res struct {
+		JobID string `json:"jobId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	if res.JobID == "" {
+		return "", fmt.Errorf("empty jobId in response")
+	}
+	r.jobID = res.JobID
+	return r.addr + "?job=" + res.JobID, nil
+}
+
+// push sends a single SSE frame to the web server for the active job.
+func (r *cliReporter) push(event string, data any) {
+	if r.jobID == "" {
+		return
+	}
+	b, err := json.Marshal(map[string]any{"event": event, "data": data})
+	if err != nil {
+		return
+	}
+	resp, err := r.client.Post(r.addr+"/api/cli/event?job="+r.jobID, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+func cmdPack(manifestPath string, rep *cliReporter) {
 	refs, err := loadRefs(manifestPath)
 	if err != nil {
 		log.Fatal(err)
@@ -619,32 +679,127 @@ func cmdPack(manifestPath string) {
 	craneAuthOpt := makeAuthOption()
 	remoteAuthOpt := makeRemoteAuthOption()
 
-	// Each worker downloads blobs concurrently (WriteImage/WriteIndex only write
-	// sha256-named blobs via atomic rename, safe to run in parallel). After blobs
-	// land, each goroutine immediately appends its descriptor to index.json under
-	// a mutex so the store is queryable as images arrive rather than only at the
-	// end of the batch.
+	// metaResult caches the manifest metadata gathered during the reporter
+	// pre-flight phase so goroutines don't re-fetch it during blob download.
+	type metaResult struct {
+		desc    *remote.Descriptor
+		seeds   []layerSeed
+		isIndex bool
+	}
+	meta := make([]metaResult, len(refs))
+
+	var sink *packSink
+	var stopTicker chan struct{}
+	var tickerDone <-chan struct{}
+
+	if rep != nil {
+		// Pre-flight: gather layer metadata concurrently to populate the job event
+		// with accurate layer counts and total bytes before any blobs land.
+		sem0 := make(chan struct{}, jobs)
+		var wg0 sync.WaitGroup
+		for i, ref := range refs {
+			wg0.Add(1)
+			sem0 <- struct{}{}
+			go func(i int, ref ImageRef) {
+				defer wg0.Done()
+				defer func() { <-sem0 }()
+				named, err := name.ParseReference(ref.Source)
+				if err != nil {
+					log.Printf("reporter: parse %s: %v", ref.Source, err)
+					return
+				}
+				desc, err := remote.Get(named, remoteAuthOpt)
+				if err != nil {
+					log.Printf("reporter: get %s: %v", ref.Source, err)
+					return
+				}
+				seeds, _, isIndex, err := gatherLayers("./store", desc)
+				if err != nil {
+					log.Printf("reporter: layers %s: %v", ref.Source, err)
+					return
+				}
+				meta[i] = metaResult{desc: desc, seeds: seeds, isIndex: isIndex}
+			}(i, ref)
+		}
+		wg0.Wait()
+
+		// Aggregate all layers (deduplicating shared blobs across images) into one
+		// packSink whose onEmit callback POSTs progress frames to the web server.
+		now := time.Now()
+		sink = &packSink{
+			onEmit:   rep.push,
+			byDigest: map[string]*layerProg{},
+			start:    now,
+			prevTime: now,
+		}
+		for _, m := range meta {
+			for _, sd := range m.seeds {
+				if _, exists := sink.byDigest[sd.digest]; exists {
+					continue // deduplicate layers shared across images
+				}
+				lp := &layerProg{Index: len(sink.layers), Digest: sd.digest, Size: sd.size, Cached: sd.cached}
+				if sd.cached {
+					lp.Received = sd.size
+					lp.Done = true
+					sink.received += sd.size
+				}
+				sink.total += sd.size
+				sink.layers = append(sink.layers, lp)
+				sink.byDigest[sd.digest] = lp
+			}
+		}
+
+		layers := make([]map[string]any, len(sink.layers))
+		for i, lp := range sink.layers {
+			layers[i] = map[string]any{
+				"i": lp.Index, "digest": lp.Digest, "size": lp.Size,
+				"received": lp.Received, "cached": lp.Cached, "done": lp.Done,
+			}
+		}
+		watchURL, regErr := rep.register(map[string]any{
+			"kind": "pack", "ref": manifestPath, "name": filepath.Base(manifestPath),
+			"totalBytes": sink.total, "layers": layers,
+		})
+		if regErr != nil {
+			log.Printf("cli reporter unavailable: %v — continuing without visualization", regErr)
+			rep = nil
+			sink = nil
+		} else {
+			log.Printf("watching at %s", watchURL)
+			stopTicker = make(chan struct{})
+			tickerDone = runTicker(sink.emit, stopTicker)
+		}
+	}
+
+	// Parallel blob downloads. Each goroutine reuses pre-gathered metadata when
+	// the reporter pre-flight ran; otherwise it fetches fresh via remote.Get.
+	// Blobs are content-addressed (atomic rename) — safe to write concurrently.
+	// index.json is serialized via mu so the store is queryable as images land.
 	var mu sync.Mutex
 	sem := make(chan struct{}, jobs)
 	var wg sync.WaitGroup
 
-	for _, ref := range refs {
+	for i, ref := range refs {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(ref ImageRef) {
+		go func(i int, ref ImageRef) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			named, err := name.ParseReference(ref.Source)
-			if err != nil {
-				log.Printf("failed to parse ref %s: %v", ref.Source, err)
-				return
-			}
-
-			desc, err := remote.Get(named, remoteAuthOpt)
-			if err != nil {
-				log.Printf("failed to fetch descriptor %s: %v", ref.Source, err)
-				return
+			var desc *remote.Descriptor
+			if meta[i].desc != nil {
+				desc = meta[i].desc
+			} else {
+				named, err := name.ParseReference(ref.Source)
+				if err != nil {
+					log.Printf("failed to parse ref %s: %v", ref.Source, err)
+					return
+				}
+				desc, err = remote.Get(named, remoteAuthOpt)
+				if err != nil {
+					log.Printf("failed to fetch descriptor %s: %v", ref.Source, err)
+					return
+				}
 			}
 
 			blobPath := filepath.Join("./store", "blobs", desc.Digest.Algorithm, desc.Digest.Hex)
@@ -663,7 +818,11 @@ func cmdPack(manifestPath string) {
 					log.Printf("pull failed %s: %v", ref.Source, err)
 					return
 				}
-				if err := lyt.WriteIndex(idx); err != nil {
+				var toWrite v1.ImageIndex = idx
+				if sink != nil {
+					toWrite = progressIndex{idx: idx, sink: sink}
+				}
+				if err := lyt.WriteIndex(toWrite); err != nil {
 					log.Printf("save failed %s: %v", ref.Source, err)
 					return
 				}
@@ -674,7 +833,11 @@ func cmdPack(manifestPath string) {
 					log.Printf("pull failed %s: %v", ref.Source, err)
 					return
 				}
-				if err := lyt.WriteImage(img); err != nil {
+				var toWrite v1.Image = img
+				if sink != nil {
+					toWrite = progressImage{Image: img, sink: sink}
+				}
+				if err := lyt.WriteImage(toWrite); err != nil {
 					log.Printf("save failed %s: %v", ref.Source, err)
 					return
 				}
@@ -696,10 +859,21 @@ func cmdPack(manifestPath string) {
 			}
 			mu.Unlock()
 			log.Printf("saved %s", ref.Rewrite)
-		}(ref)
+		}(i, ref)
 	}
 
 	wg.Wait()
+
+	if stopTicker != nil {
+		close(stopTicker)
+		<-tickerDone
+		sink.emit(true)
+		rep.push("done", map[string]any{
+			"ok": true, "ref": manifestPath,
+			"totalBytes": sink.total,
+			"durationMs": time.Since(sink.start).Milliseconds(),
+		})
+	}
 
 	log.Println("store ready at ./store")
 }
@@ -1002,7 +1176,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy serve [store-path]\n  gappy web [store-path] [listen-addr]\n  gappy discover [dir]\n  gappy version")
+		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy serve [store-path]\n  gappy web [store-path] [listen-addr]\n  gappy discover [dir]\n  gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store] [out]\n  gappy join <out-dir> <disc-001> [disc-002 ...]\n  gappy version")
 	}
 
 	switch args[0] {
@@ -1010,7 +1184,7 @@ func main() {
 		if len(args) < 2 {
 			log.Fatal("usage: gappy pack <images.txt|manifest.yaml>")
 		}
-		cmdPack(args[1])
+		cmdPack(args[1], newCLIReporter(webAddr))
 	case "pack-charts":
 		if len(args) < 2 {
 			log.Fatal("usage: gappy pack-charts <found-charts.txt|manifest.yaml>")
@@ -1028,6 +1202,30 @@ func main() {
 			root = args[1]
 		}
 		cmdDiscover(root)
+	case "verify":
+		storeDir := "./store"
+		if len(args) >= 2 {
+			storeDir = args[1]
+		}
+		cmdVerify(storeDir)
+	case "split":
+		if len(args) < 2 {
+			log.Fatal("usage: gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store-path] [out-dir]")
+		}
+		storeDir := "./store"
+		outDir := "."
+		if len(args) >= 3 {
+			storeDir = args[2]
+		}
+		if len(args) >= 4 {
+			outDir = args[3]
+		}
+		cmdSplit(args[1], storeDir, outDir)
+	case "join":
+		if len(args) < 3 {
+			log.Fatal("usage: gappy join <out-dir> <disc-001> [disc-002 ...]")
+		}
+		cmdJoin(args[1], args[2:])
 	case "version":
 		cmdVersion()
 	case "web":

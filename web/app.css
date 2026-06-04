@@ -76,6 +76,19 @@ b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink); }
 .panel-title .right { margin-left: auto; }
 .mono { font-family: var(--mono); }
 
+/* search bar */
+.search-wrap {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 11px; border-bottom: 1px solid var(--grid); flex: none;
+}
+.search-ps1 { color: var(--phos-dim); font-size: 13px; opacity: 0.8; }
+.search-wrap input {
+  flex: 1; background: transparent; border: none; outline: none;
+  color: var(--ink); font-family: var(--mono); font-size: 12px;
+  caret-color: var(--phos);
+}
+.search-wrap input::placeholder { color: var(--ink-dim); opacity: 0.4; }
+
 /* browse cards */
 .browse { flex: 1; }
 .cards { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 7px; flex: 1; min-height: 0; }
@@ -180,6 +193,67 @@ b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--grid); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--phos-dim); }
+
+/* ── image detail modal ─────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal-overlay.hidden { display: none; }
+.modal-bd {
+  position: absolute; inset: 0;
+  background: rgba(2,16,12,0.88);
+}
+.modal-panel {
+  position: relative; z-index: 1;
+  background: var(--bg-panel); border: 1px solid var(--phos-dim);
+  width: min(90vw, 740px); max-height: 82vh;
+  display: flex; flex-direction: column;
+  box-shadow: 0 0 40px rgba(57,255,20,0.12), 0 0 0 1px rgba(57,255,20,0.06) inset;
+}
+.modal-hdr {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 9px 14px; border-bottom: 1px solid var(--grid); flex: none;
+  overflow: hidden;
+}
+.modal-label { font-size: 11px; letter-spacing: 0.14em; color: var(--phos-dim); flex: none; }
+.modal-ref { color: var(--ink); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-digest { color: var(--amber); font-size: 11px; opacity: 0.85; flex: none; }
+.modal-close {
+  margin-left: 6px; background: none; border: none; color: var(--ink-dim);
+  cursor: pointer; font-family: var(--mono); font-size: 16px; padding: 0 2px;
+  line-height: 1; flex: none;
+}
+.modal-close:hover { color: var(--danger); }
+.modal-plats { display: flex; gap: 6px; flex-wrap: wrap; padding: 7px 14px; border-bottom: 1px solid var(--grid); flex: none; }
+.modal-plats:empty { display: none; }
+.plat-tab {
+  font-size: 10px; padding: 2px 8px; border: 1px solid var(--grid);
+  color: var(--ink-dim); border-radius: 2px; cursor: pointer; letter-spacing: 0.04em;
+}
+.plat-tab:hover { border-color: var(--cyan); color: var(--cyan); }
+.plat-tab.active { border-color: var(--cyan); color: var(--cyan); background: rgba(43,229,200,0.08); }
+.modal-body { overflow-y: auto; flex: 1; min-height: 0; }
+.modal-section { padding: 10px 14px; border-bottom: 1px solid var(--grid); }
+.modal-section:last-child { border-bottom: none; }
+.modal-sec-title {
+  font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--phos-dim); margin-bottom: 8px;
+  display: flex; align-items: center;
+}
+.modal-sec-title span { color: var(--ink-dim); text-transform: none; letter-spacing: 0; font-size: 11px; margin-left: auto; }
+.modal-layer { display: flex; align-items: center; gap: 8px; font-size: 11px; margin-bottom: 5px; }
+.modal-layer .ld { color: var(--amber); opacity: 0.8; width: 78px; flex: none; font-size: 10px; }
+.modal-layer .bar { flex: 1; height: 7px; background: rgba(255,255,255,0.05); border: 1px solid var(--grid); position: relative; overflow: hidden; }
+.modal-layer .bar i { position: absolute; inset: 0 auto 0 0; background: var(--amber); opacity: 0.7; }
+.modal-layer .sz { width: 72px; flex: none; text-align: right; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+.modal-cfg { display: grid; grid-template-columns: 90px 1fr; gap: 4px 14px; font-size: 11px; }
+.modal-cfg .k { color: var(--phos-dim); }
+.modal-cfg .v { color: var(--ink); word-break: break-all; }
+/* cards are clickable when store is populated */
+.card { cursor: default; }
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { border-color: var(--phos-dim); background: rgba(57,255,20,0.04); }
 
 @media (prefers-reduced-motion: reduce) {
   .prompt .caret { animation: none; }

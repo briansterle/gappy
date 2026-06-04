@@ -26,6 +26,10 @@
       <section class="left">
         <div class="panel browse">
           <div class="panel-title">STORE <span class="path" id="storePath">./store</span></div>
+          <div class="search-wrap">
+            <span class="search-ps1">/</span>
+            <input id="search" placeholder="filter…" autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
           <div class="cards" id="cards"><div class="empty">scanning store…</div></div>
         </div>
         <div class="panel add">
@@ -81,6 +85,30 @@
       <span>LANES&nbsp;<b id="mLanes">0</b></span>
     </footer>
   </div>
+  <!-- image detail modal -->
+  <div id="modal" class="modal-overlay hidden">
+    <div class="modal-bd" id="modalBd"></div>
+    <div class="modal-panel">
+      <div class="modal-hdr">
+        <span class="modal-label">IMAGE</span>
+        <span class="modal-ref" id="modalRef"></span>
+        <span class="modal-digest" id="modalDigest"></span>
+        <button class="modal-close" id="modalClose">✕</button>
+      </div>
+      <div class="modal-plats" id="modalPlats"></div>
+      <div class="modal-body">
+        <div class="modal-section">
+          <div class="modal-sec-title">LAYERS <span id="modalLayerCount"></span></div>
+          <div id="modalLayers"></div>
+        </div>
+        <div class="modal-section" id="modalCfgSection">
+          <div class="modal-sec-title">CONFIG</div>
+          <div class="modal-cfg" id="modalCfg"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

@@ -63,6 +63,8 @@ function roundRect(ctx, x, y, w, h, r) {
 }
 
 // ─── state ───────────────────────────────────────────────────────────────────
+let _knownJobId = null; // tracks the last job we connected to so the poller doesn't re-open it
+
 const S = {
   kind: null, ref: '', name: '',
   packets: [], byIndex: new Map(),
@@ -351,6 +353,7 @@ function tickCounters(dt) {
 let es = null;
 
 function openStream(jobId) {
+  _knownJobId = jobId;
   if (es) { es.close(); es = null; }
   es = new EventSource('/api/stream?job=' + encodeURIComponent(jobId));
   es.addEventListener('job', (e) => onJob(JSON.parse(e.data)));
@@ -525,14 +528,17 @@ function renderCards(images, charts) {
   charts = charts || [];
   const el = $('cards');
   el.innerHTML = '';
+  $('search').value = '';
   if (!images.length && !charts.length) {
     el.innerHTML = '<div class="empty">store empty — add an image below</div>';
     return;
   }
   for (const im of images) {
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'card clickable';
     card.dataset.ref = im.ref;
+    card.dataset.digest = im.digest;
+    card.addEventListener('click', () => openModal(im.digest));
     const badge = im.isIndex ? '<span class="badge idx">idx</span>' : '<span class="badge">img</span>';
     const plats = (im.platforms || []).map((p) => `<span class="chip">${escapeHtml(p)}</span>`).join('');
     card.innerHTML =
@@ -559,6 +565,117 @@ function renderCards(images, charts) {
       `<div class="meta"><span>${fmtBytes(c.size)}</span>${ver}${repo}</div>` +
       `<div class="microbar"><i style="width:100%"></i></div>`;
     el.appendChild(card);
+  }
+}
+
+// ─── image detail modal ───────────────────────────────────────────────────────
+async function openModal(digest) {
+  if (!digest) return;
+  try {
+    const r = await fetch('/api/image-detail?digest=' + encodeURIComponent(digest));
+    if (!r.ok) return;
+    const d = await r.json();
+    renderModal(d);
+    $('modal').classList.remove('hidden');
+  } catch (_) {}
+}
+
+function closeModal() {
+  $('modal').classList.add('hidden');
+}
+
+let _modalPlatIdx = 0;
+
+function renderModal(d) {
+  _modalPlatIdx = 0;
+  $('modalRef').textContent = d.ref || '';
+  $('modalDigest').textContent = shortDigest(d.digest);
+  const platforms = d.platforms || [];
+
+  const tabs = $('modalPlats');
+  tabs.innerHTML = '';
+  if (platforms.length > 1) {
+    platforms.forEach((p, i) => {
+      const tab = document.createElement('span');
+      tab.className = 'plat-tab' + (i === 0 ? ' active' : '');
+      tab.textContent = p.platform || '?';
+      tab.onclick = () => {
+        _modalPlatIdx = i;
+        tabs.querySelectorAll('.plat-tab').forEach((t, ti) => t.classList.toggle('active', ti === i));
+        renderPlatform(platforms[i]);
+      };
+      tabs.appendChild(tab);
+    });
+  }
+
+  if (platforms.length > 0) renderPlatform(platforms[0]);
+}
+
+function renderPlatform(p) {
+  const layers = p.layers || [];
+  const maxSize = Math.max(1, ...layers.map((l) => l.size));
+  const layersEl = $('modalLayers');
+  const countEl = $('modalLayerCount');
+  layersEl.innerHTML = '';
+  countEl.textContent = layers.length + ' layer' + (layers.length !== 1 ? 's' : '') + ' · ' + fmtBytes(p.layerTotal || 0);
+
+  for (const l of layers) {
+    const row = document.createElement('div');
+    row.className = 'modal-layer';
+    const pct = ((l.size / maxSize) * 100).toFixed(1);
+    row.innerHTML =
+      `<span class="ld">${shortDigest(l.digest)}</span>` +
+      `<span class="bar"><i style="width:${pct}%"></i></span>` +
+      `<span class="sz">${fmtBytes(l.size)}</span>`;
+    layersEl.appendChild(row);
+  }
+
+  const cfg = p.config || {};
+  const cfgEl = $('modalCfg');
+  cfgEl.innerHTML = '';
+  const rows = [
+    ['platform', p.platform],
+    ['created', cfg.created ? cfg.created.slice(0, 10) : null],
+    ['entrypoint', (cfg.entrypoint || []).length ? cfg.entrypoint.join(' ') : null],
+    ['cmd', (cfg.cmd || []).length ? cfg.cmd.join(' ') : null],
+    ...Object.entries(cfg.labels || {}).slice(0, 8).map(([k, v]) => [k, v]),
+  ].filter(([, v]) => v);
+
+  for (const [k, v] of rows) {
+    const kEl = document.createElement('span');
+    kEl.className = 'k';
+    kEl.textContent = k;
+    const vEl = document.createElement('span');
+    vEl.className = 'v';
+    vEl.textContent = v;
+    cfgEl.appendChild(kEl);
+    cfgEl.appendChild(vEl);
+  }
+
+  $('modalCfgSection').style.display = rows.length ? '' : 'none';
+}
+
+function filterCards() {
+  const term = ($('search').value || '').trim().toLowerCase();
+  const cards = $('cards');
+  let visibleCharts = 0, visibleImages = 0;
+  let inChartSection = false;
+  for (const el of cards.children) {
+    if (el.classList.contains('cards-divider')) {
+      inChartSection = true;
+      el.style.display = '';
+      continue;
+    }
+    if (!el.classList.contains('card')) { el.style.display = ''; continue; }
+    const match = !term || el.textContent.toLowerCase().includes(term);
+    el.style.display = match ? '' : 'none';
+    if (match) { inChartSection ? visibleCharts++ : visibleImages++; }
+  }
+  // hide the divider when no chart cards are visible
+  for (const el of cards.children) {
+    if (el.classList.contains('cards-divider')) {
+      el.style.display = visibleCharts === 0 ? 'none' : '';
+    }
   }
 }
 
@@ -622,13 +739,30 @@ async function doUnpack() {
   }
 }
 
+// ─── job poller ───────────────────────────────────────────────────────────────
+// Polls /api/latest-job every second so CLI-initiated packs appear automatically
+// without the user needing to open the ?job= URL manually.
+function pollForJobs() {
+  fetch('/api/latest-job')
+    .then((r) => r.json())
+    .then((d) => { if (d.jobId && d.jobId !== _knownJobId) openStream(d.jobId); })
+    .catch(() => {});
+}
+
 // ─── boot ──────────────────────────────────────────────────────────────────────
+$('search').addEventListener('input', filterCards);
 $('packBtn').addEventListener('click', doPack);
 $('unpackBtn').addEventListener('click', doUnpack);
 $('ref').addEventListener('keydown', (e) => { if (e.key === 'Enter') doPack(); });
+$('modalClose').addEventListener('click', closeModal);
+$('modalBd').addEventListener('click', closeModal);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 
 stage = setupCanvas($('stage'));
 chart = setupCanvas($('chart'));
 loadImages();
 requestAnimationFrame(frame);
-$('ref').focus();
+
+const _jobParam = new URLSearchParams(location.search).get('job');
+if (_jobParam) { openStream(_jobParam); } else { $('ref').focus(); }
+setInterval(pollForJobs, 1000);

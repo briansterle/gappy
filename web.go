@@ -80,9 +80,10 @@ func (j *job) finish() {
 }
 
 type hub struct {
-	mu   sync.Mutex
-	jobs map[string]*job
-	seq  int
+	mu     sync.Mutex
+	jobs   map[string]*job
+	seq    int
+	latest string // ID of the most recently created job
 }
 
 func newHub() *hub { return &hub{jobs: map[string]*job{}} }
@@ -94,6 +95,7 @@ func (h *hub) create(kind string) *job {
 	j := &job{id: fmt.Sprintf("%s-%d", kind, h.seq), kind: kind}
 	j.cond = sync.NewCond(&j.mu)
 	h.jobs[j.id] = j
+	h.latest = j.id
 	return j
 }
 
@@ -118,9 +120,9 @@ type layerProg struct {
 }
 
 type packSink struct {
-	j     *job
-	total int64
-	start time.Time
+	onEmit  func(string, any)
+	total   int64
+	start   time.Time
 
 	mu       sync.Mutex
 	layers   []*layerProg
@@ -168,7 +170,7 @@ func (s *packSink) emit(done bool) {
 	if bps > 0 && total > recv {
 		eta = float64(total-recv) / bps
 	}
-	s.j.emit("progress", map[string]any{
+	s.onEmit("progress", map[string]any{
 		"received": recv,
 		"total":    total,
 		"bps":      int64(bps),
@@ -459,7 +461,7 @@ type layerSeed struct {
 
 // gatherLayers fetches manifests (cheap) to enumerate the deduped layer set and
 // total bytes for a reference, plus platform labels.
-func gatherLayers(s *server, desc *remote.Descriptor) (seeds []layerSeed, platforms []string, isIndex bool, err error) {
+func gatherLayers(storeDir string, desc *remote.Descriptor) (seeds []layerSeed, platforms []string, isIndex bool, err error) {
 	platforms = []string{}
 	if desc.MediaType.IsIndex() {
 		isIndex = true
@@ -493,7 +495,7 @@ func gatherLayers(s *server, desc *remote.Descriptor) (seeds []layerSeed, platfo
 					continue
 				}
 				seen[ds] = true
-				seeds = append(seeds, layerSeed{digest: ds, size: l.Size, cached: isCached(s.storeDir, ds, l.Size)})
+				seeds = append(seeds, layerSeed{digest: ds, size: l.Size, cached: isCached(storeDir, ds, l.Size)})
 			}
 		}
 		return seeds, platforms, true, nil
@@ -509,7 +511,7 @@ func gatherLayers(s *server, desc *remote.Descriptor) (seeds []layerSeed, platfo
 	}
 	for _, l := range mf.Layers {
 		ds := l.Digest.String()
-		seeds = append(seeds, layerSeed{digest: ds, size: l.Size, cached: isCached(s.storeDir, ds, l.Size)})
+		seeds = append(seeds, layerSeed{digest: ds, size: l.Size, cached: isCached(storeDir, ds, l.Size)})
 	}
 	if cf, err := img.ConfigFile(); err == nil && cf != nil && cf.OS != "" {
 		platforms = append(platforms, fmt.Sprintf("%s/%s", cf.OS, cf.Architecture))
@@ -534,14 +536,14 @@ func (s *server) runPack(j *job, ref string) {
 		return
 	}
 
-	seeds, platforms, isIndex, err := gatherLayers(s, desc)
+	seeds, platforms, isIndex, err := gatherLayers(s.storeDir, desc)
 	if err != nil {
 		j.emit("error", map[string]string{"msg": fmt.Sprintf("manifest read failed: %v", err)})
 		return
 	}
 
 	sink := &packSink{
-		j:        j,
+		onEmit:   j.emit,
 		start:    start,
 		byDigest: map[string]*layerProg{},
 		prevTime: start,
@@ -1100,6 +1102,218 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
+// ── image detail ─────────────────────────────────────────────────────────────
+
+type platDetail struct {
+	Platform   string      `json:"platform"`
+	Digest     string      `json:"digest"`
+	LayerTotal int64       `json:"layerTotal"`
+	Layers     []layerJSON `json:"layers"`
+	Config     *cfgJSON    `json:"config,omitempty"`
+}
+
+type layerJSON struct {
+	Digest string `json:"digest"`
+	Size   int64  `json:"size"`
+}
+
+type cfgJSON struct {
+	OS           string            `json:"os"`
+	Architecture string            `json:"architecture"`
+	Created      string            `json:"created,omitempty"`
+	Cmd          []string          `json:"cmd,omitempty"`
+	Entrypoint   []string          `json:"entrypoint,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+}
+
+func buildPlatDetail(img v1.Image) platDetail {
+	pd := platDetail{}
+	if mf, err := img.Manifest(); err == nil {
+		for _, l := range mf.Layers {
+			pd.Layers = append(pd.Layers, layerJSON{Digest: l.Digest.String(), Size: l.Size})
+			pd.LayerTotal += l.Size
+		}
+	}
+	if cf, err := img.ConfigFile(); err == nil && cf != nil {
+		c := &cfgJSON{
+			OS:           cf.OS,
+			Architecture: cf.Architecture,
+			Labels:       cf.Config.Labels,
+			Cmd:          cf.Config.Cmd,
+			Entrypoint:   cf.Config.Entrypoint,
+		}
+		if !cf.Created.Time.IsZero() {
+			c.Created = cf.Created.Time.Format(time.RFC3339)
+		}
+		if pd.Platform == "" && c.OS != "" {
+			pd.Platform = c.OS + "/" + c.Architecture
+		}
+		pd.Config = c
+	}
+	return pd
+}
+
+func (s *server) handleImageDetail(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query().Get("digest")
+	if raw == "" {
+		http.Error(w, "missing digest", http.StatusBadRequest)
+		return
+	}
+	hash, err := v1.NewHash(raw)
+	if err != nil {
+		http.Error(w, "bad digest", http.StatusBadRequest)
+		return
+	}
+	rootIdx, err := layout.ImageIndexFromPath(s.storeDir)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	im, err := rootIdx.IndexManifest()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	var topDesc *v1.Descriptor
+	for i := range im.Manifests {
+		if im.Manifests[i].Digest == hash {
+			topDesc = &im.Manifests[i]
+			break
+		}
+	}
+	if topDesc == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		return
+	}
+
+	ref := ""
+	if topDesc.Annotations != nil {
+		ref = topDesc.Annotations[refAnnotationKey]
+	}
+	if ref == "" {
+		ref = topDesc.Digest.String()
+	}
+
+	result := map[string]any{
+		"ref":       ref,
+		"digest":    topDesc.Digest.String(),
+		"mediaType": string(topDesc.MediaType),
+		"isIndex":   topDesc.MediaType.IsIndex(),
+	}
+
+	var plats []platDetail
+
+	if topDesc.MediaType.IsIndex() {
+		idx, err := rootIdx.ImageIndex(hash)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		cm, err := idx.IndexManifest()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		for _, m := range cm.Manifests {
+			if !m.MediaType.IsImage() {
+				continue
+			}
+			img, err := idx.Image(m.Digest)
+			if err != nil {
+				continue
+			}
+			pd := buildPlatDetail(img)
+			pd.Digest = m.Digest.String()
+			if m.Platform != nil {
+				pd.Platform = m.Platform.String()
+			}
+			plats = append(plats, pd)
+		}
+	} else {
+		img, err := rootIdx.Image(hash)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		pd := buildPlatDetail(img)
+		pd.Digest = topDesc.Digest.String()
+		plats = append(plats, pd)
+	}
+
+	result["platforms"] = plats
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleLatestJob returns the ID and kind of the most recently created job so
+// the browser can auto-connect without needing the ?job= URL parameter.
+func (s *server) handleLatestJob(w http.ResponseWriter, r *http.Request) {
+	s.hub.mu.Lock()
+	id := s.hub.latest
+	s.hub.mu.Unlock()
+	if id == "" {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	j := s.hub.get(id)
+	if j == nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobId": j.id, "kind": j.kind})
+}
+
+// handleCliStart creates a new SSE job seeded by a CLI pack invocation.
+// The CLI posts the "job" event payload; we return the jobId so the CLI
+// can push subsequent progress frames via handleCliEvent.
+func (s *server) handleCliStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
+		return
+	}
+	kind, _ := body["kind"].(string)
+	if kind == "" {
+		kind = "pack"
+	}
+	j := s.hub.create(kind)
+	j.emit("job", body)
+	writeJSON(w, http.StatusOK, map[string]string{"jobId": j.id})
+}
+
+// handleCliEvent pushes a single SSE frame into an existing CLI job so all
+// connected browser clients receive it immediately via the /api/stream endpoint.
+func (s *server) handleCliEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	j := s.hub.get(r.URL.Query().Get("job"))
+	if j == nil {
+		http.Error(w, "no such job", http.StatusNotFound)
+		return
+	}
+	var body struct {
+		Event string          `json:"event"`
+		Data  json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Event == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "need {event, data}"})
+		return
+	}
+	j.mu.Lock()
+	j.frames = append(j.frames, frame{event: body.Event, data: string(body.Data)})
+	j.cond.Broadcast()
+	j.mu.Unlock()
+	if body.Event == "done" || body.Event == "error" {
+		j.finish()
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *server) routes() http.Handler {
 	assets, err := fs.Sub(webAssets, "web")
 	if err != nil {
@@ -1110,6 +1324,10 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/pack", s.handlePack)
 	mux.HandleFunc("/api/unpack", s.handleUnpack)
 	mux.HandleFunc("/api/stream", s.handleStream)
+	mux.HandleFunc("/api/cli/start", s.handleCliStart)
+	mux.HandleFunc("/api/cli/event", s.handleCliEvent)
+	mux.HandleFunc("/api/latest-job", s.handleLatestJob)
+	mux.HandleFunc("/api/image-detail", s.handleImageDetail)
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	return mux
 }

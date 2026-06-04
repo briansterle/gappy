@@ -35,12 +35,14 @@ Requires Go 1.21+.
 ## Commands
 
 ```
-gappy [-j N] pack <images.txt|manifest.yaml>        pack container images
-gappy [-j N] pack-charts <charts.txt|manifest.yaml>  pack Helm charts
-gappy serve [store-path]                             serve images + charts
-gappy web [store-path] [listen-addr]                 browser UI: browse, add, visualize
-gappy discover [dir]                                 find image and chart refs
-gappy version                                        print version info
+gappy [-j N] pack <images.txt|manifest.yaml>              pack container images
+gappy [-j N] pack-charts <charts.txt|manifest.yaml>        pack Helm charts
+gappy serve [store-path]                                   serve images + charts
+gappy web [store-path] [listen-addr]                       browser UI: browse, add, visualize
+gappy discover [dir]                                       find image and chart refs
+gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store] [out]  split store into disc volumes
+gappy join <out-dir> <disc-001> [disc-002 ...]             merge disc volumes into a store
+gappy version                                              print version info
 ```
 
 `-j N` controls parallel download workers (default: CPU count - 1). Hauler is single-threaded; `-j 12` or higher makes a material difference on large manifests.
@@ -136,6 +138,46 @@ Helm HTTP repos are auto-discovered from subdirectories of `./store/helm/` at st
 helm repo add my-helm-repo http://localhost:5000/my-helm-repo
 helm pull my-helm-repo/my-chart --version 1.2.3
 ```
+
+### 5. Split onto physical media
+
+When the air gap is crossed by physical media (DVD, Blu-ray), split the packed store into
+disc-sized volumes before burning:
+
+```bash
+# DVD-5 (4.7 GB discs)
+gappy split dvd
+
+# Blu-ray BD-25 (25 GB discs)
+gappy split bd25
+
+# Custom size
+gappy split 4.7GB ./store ./discs
+```
+
+Supported presets:
+
+| Flag | Rated capacity | Usable (after UDF overhead) |
+|---|---|---|
+| `dvd`   | 4.7 GB  | 4.4 GB  |
+| `dvd9`  | 8.5 GB  | 8.1 GB  |
+| `bd25`  | 25 GB   | 23.8 GB |
+| `bd50`  | 50 GB   | 47.5 GB |
+| `bd100` | 100 GB  | 95 GB   |
+
+Each `disc-NNN/` directory is a valid OCI layout — `gappy serve disc-001/` works
+directly from a mounted disc without rejoining. Blobs shared between images are
+de-duplicated within each disc, so shared base layers cost space only once per disc.
+
+To reassemble after transport:
+
+```bash
+gappy join merged-store /mnt/disc-001 /mnt/disc-002 /mnt/disc-003
+gappy serve merged-store
+```
+
+Blobs shared across discs are de-duplicated during join (hard-linked when on the same
+filesystem, copied cross-device). The joined store is identical to the original.
 
 ### Pushing into the registry
 
