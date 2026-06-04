@@ -709,9 +709,10 @@ type unpackSink struct {
 		Done     bool
 	}
 
-	mu       sync.Mutex
-	received int64
-	served   int
+	mu          sync.Mutex
+	received    int64
+	served      int
+	servedRefs  []string
 }
 
 func (u *unpackSink) update(i int, complete, total int64) {
@@ -754,6 +755,7 @@ func (u *unpackSink) markServed(i int, ref string) {
 	}
 	im.Done = true
 	u.served++
+	u.servedRefs = append(u.servedRefs, ref)
 	u.mu.Unlock()
 	u.j.emit("served", map[string]any{"i": i, "ref": ref})
 }
@@ -896,13 +898,25 @@ func (s *server) runUnpack(j *job) {
 	<-tickerDone
 	sink.emit(true)
 
+	sink.mu.Lock()
+	servedRefs := append([]string(nil), sink.servedRefs...)
+	sink.mu.Unlock()
+
+	j.log("registry ready — %d image(s) served on %s", len(servedRefs), addr)
+	j.log("─────────────────────────────────────────────")
+	for _, ref := range servedRefs {
+		j.log("  docker pull %s/%s", addr, ref)
+	}
+	j.log("─────────────────────────────────────────────")
+	j.log("TLS error? add %s to Docker insecure registries", addr)
+	j.log("  Rancher Desktop → Preferences → Container Engine → Allowed Insecure Registries")
+
 	j.emit("done", map[string]any{
 		"ok":         true,
 		"addr":       addr,
 		"count":      len(imgs),
 		"durationMs": time.Since(start).Milliseconds(),
 	})
-	j.log("registry ready on %s", addr)
 }
 
 // ---------------------------------------------------------------------------
