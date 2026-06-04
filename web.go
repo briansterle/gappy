@@ -1346,8 +1346,16 @@ func (s *server) routes() http.Handler {
 	return mux
 }
 
-func cmdWeb(storeDir, addr string) {
+func cmdWeb(storeDir, addr string, serveOnStart bool) {
 	srv := newServer(storeDir)
+	if serveOnStart {
+		regAddr, err := srv.ensureRegistry()
+		if err != nil {
+			log.Printf("registry start failed: %v", err)
+		} else {
+			log.Printf("registry → %s", regAddr)
+		}
+	}
 	log.Printf("gappy web UI → http://%s  (store: %s)", addr, storeDir)
 	if err := http.ListenAndServe(addr, srv.routes()); err != nil {
 		log.Fatal(err)

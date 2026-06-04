@@ -1229,15 +1229,19 @@ func main() {
 	case "version":
 		cmdVersion()
 	case "web":
+		fs := flag.NewFlagSet("web", flag.ExitOnError)
+		serveFlag := fs.Bool("serve", false, "start the OCI registry immediately on launch")
+		_ = fs.Parse(args[1:])
+		rest := fs.Args()
 		storePath := "./store"
 		addr := "127.0.0.1:8080"
-		if len(args) >= 2 {
-			storePath = args[1]
+		if len(rest) >= 1 {
+			storePath = rest[0]
 		}
-		if len(args) >= 3 {
-			addr = args[2]
+		if len(rest) >= 2 {
+			addr = rest[1]
 		}
-		cmdWeb(storePath, addr)
+		cmdWeb(storePath, addr, *serveFlag)
 	default:
 		log.Fatalf("unknown command %q — use pack, pack-charts, serve, web, discover, or version", args[0])
 	}
