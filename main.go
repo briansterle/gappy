@@ -619,21 +619,19 @@ func cmdPack(manifestPath string) {
 	craneAuthOpt := makeAuthOption()
 	remoteAuthOpt := makeRemoteAuthOption()
 
-	// Each worker downloads its blobs into the content-addressed store with NO
-	// lock — WriteImage/WriteIndex only write sha256-named blobs (temp file +
-	// atomic rename), which is safe to do concurrently. The only shared mutable
-	// state is index.json, so we collect descriptors into a per-ref slot (each
-	// goroutine owns results[i], no synchronization needed) and append them all
-	// to index.json serially after every download has finished. The slow,
-	// network-bound work runs fully parallel; nothing blocks on a lock.
-	results := make([]*v1.Descriptor, len(refs))
+	// Each worker downloads blobs concurrently (WriteImage/WriteIndex only write
+	// sha256-named blobs via atomic rename, safe to run in parallel). After blobs
+	// land, each goroutine immediately appends its descriptor to index.json under
+	// a mutex so the store is queryable as images arrive rather than only at the
+	// end of the batch.
+	var mu sync.Mutex
 	sem := make(chan struct{}, jobs)
 	var wg sync.WaitGroup
 
-	for i, ref := range refs {
+	for _, ref := range refs {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(i int, ref ImageRef) {
+		go func(ref ImageRef) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
@@ -688,22 +686,20 @@ func cmdPack(manifestPath string) {
 				log.Printf("save failed %s: %v", ref.Source, err)
 				return
 			}
-			results[i] = &d
+
+			mu.Lock()
+			_ = lyt.RemoveDescriptors(func(existing v1.Descriptor) bool {
+				return existing.Annotations[refAnnotationKey] == ref.Rewrite
+			})
+			if err := lyt.AppendDescriptor(d); err != nil {
+				log.Printf("index update failed %s: %v", ref.Rewrite, err)
+			}
+			mu.Unlock()
 			log.Printf("saved %s", ref.Rewrite)
-		}(i, ref)
+		}(ref)
 	}
 
 	wg.Wait()
-
-	// Serial index.json assembly — cheap metadata writes, off the hot path.
-	for _, d := range results {
-		if d == nil {
-			continue
-		}
-		if err := lyt.AppendDescriptor(*d); err != nil {
-			log.Printf("index update failed for %s: %v", d.Annotations["org.opencontainers.image.ref.name"], err)
-		}
-	}
 
 	log.Println("store ready at ./store")
 }
