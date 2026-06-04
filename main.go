@@ -1007,7 +1007,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy serve [store-path]\n  gappy discover [dir]\n  gappy version")
+		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy serve [store-path]\n  gappy web [store-path] [listen-addr]\n  gappy discover [dir]\n  gappy version")
 	}
 
 	switch args[0] {
@@ -1035,7 +1035,17 @@ func main() {
 		cmdDiscover(root)
 	case "version":
 		cmdVersion()
+	case "web":
+		storePath := "./store"
+		addr := "127.0.0.1:8080"
+		if len(args) >= 2 {
+			storePath = args[1]
+		}
+		if len(args) >= 3 {
+			addr = args[2]
+		}
+		cmdWeb(storePath, addr)
 	default:
-		log.Fatalf("unknown command %q — use pack, pack-charts, serve, discover, or version", args[0])
+		log.Fatalf("unknown command %q — use pack, pack-charts, serve, web, discover, or version", args[0])
 	}
 }
