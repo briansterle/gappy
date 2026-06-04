@@ -38,6 +38,7 @@ Requires Go 1.21+.
 gappy [-j N] pack <images.txt|manifest.yaml>        pack container images
 gappy [-j N] pack-charts <charts.txt|manifest.yaml>  pack Helm charts
 gappy serve [store-path]                             serve images + charts
+gappy web [store-path] [listen-addr]                 browser UI: browse, add, visualize
 gappy discover [dir]                                 find image and chart refs
 gappy version                                        print version info
 ```
@@ -146,6 +147,30 @@ docker push localhost:5000/myapp:v1
 ```
 
 Pushed blobs and manifests are written straight into the OCI layout (`blobs/` + `index.json`), so they persist across restarts and travel with the store — a pushed image is indistinguishable from a packed one. Single-arch images and multi-arch indexes are both supported. The registry serves plain HTTP on `localhost`, which Docker treats as insecure by default; no extra daemon config is needed.
+
+### 5. Web UI
+
+`gappy web` serves a single-page console (Go std lib + vanilla HTML/CSS/JS, no
+frameworks, embedded in the binary via `go:embed`):
+
+```bash
+gappy web                          # http://127.0.0.1:8080, uses ./store
+gappy web ./store 127.0.0.1:8080   # explicit store path and listen address
+```
+
+- **Browse** the local OCI store — every image with its digest, size, media
+  type, platforms and layer count.
+- **Add images** — type a reference and pull it into `./store`.
+- **Live visualizations** — an "AIRGAP CONTROL" transit view streams real,
+  per-layer byte progress over Server-Sent Events as layers cross the gap
+  (packing) and as the store is loaded into the registry on `:5000`
+  (unpacking), alongside a throughput chart and telemetry.
+
+Pulling uses `GAPPY_USER`/`GAPPY_PASS` if set, otherwise the Docker keychain. If a
+misconfigured global `credsStore` (e.g. `wincred.exe` under WSL) breaks anonymous
+pulls with `401`/`DENIED`, run with a clean config: `DOCKER_CONFIG=$(mktemp -d)
+gappy web`. On AlmaLinux WSL this is usually broken `.exe` interop under systemd —
+see [docs/wsl-interop-fix.md](docs/wsl-interop-fix.md).
 
 ## Store layout
 
