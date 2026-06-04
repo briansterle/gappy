@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
@@ -73,7 +74,7 @@ func TestPushImagePersistsToStore(t *testing.T) {
 	}
 
 	dest := host + "/myapp:v1"
-	if err := crane.Push(img, dest, crane.Insecure); err != nil {
+	if err := crane.Push(img, dest, crane.Insecure, crane.WithAuth(authn.Anonymous)); err != nil {
 		t.Fatalf("push failed: %v", err)
 	}
 

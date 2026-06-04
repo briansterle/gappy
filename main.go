@@ -37,9 +37,8 @@ import (
 
 var jobs int
 
-// Set at build time via -ldflags.
 var (
-	version = "dev"
+	version = "v0.1.0"
 	commit  = "none"
 	date    = "unknown"
 )
