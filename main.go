@@ -240,7 +240,7 @@ func (s *storeWriter) persist(repo, ref, contentType string, body []byte) error 
 		MediaType:   types.MediaType(contentType),
 		Size:        int64(len(body)),
 		Digest:      hash,
-		Annotations: map[string]string{"org.opencontainers.image.ref.name": refName},
+		Annotations: map[string]string{refAnnotationKey: refName},
 	}
 	// Replace any existing descriptor for this tag so re-pushing updates in place.
 	if err := s.lyt.RemoveDescriptors(match.Name(refName)); err != nil {
@@ -595,7 +595,7 @@ func descriptorFor(d describable, ref string) (v1.Descriptor, error) {
 		MediaType:   mt,
 		Size:        sz,
 		Digest:      dig,
-		Annotations: map[string]string{"org.opencontainers.image.ref.name": ref},
+		Annotations: map[string]string{refAnnotationKey: ref},
 	}, nil
 }
 
@@ -790,7 +790,7 @@ func packOCIChart(ref string, craneAuthOpt crane.Option, remoteAuthOpt remote.Op
 	mu.Lock()
 	defer mu.Unlock()
 	if err := lyt.AppendImage(img, layout.WithAnnotations(map[string]string{
-		"org.opencontainers.image.ref.name": ref,
+		refAnnotationKey: ref,
 	})); err != nil {
 		log.Printf("save failed OCI chart %s: %v", ref, err)
 		return
@@ -938,7 +938,7 @@ func cmdServe(storePath string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			ref := d.Annotations["org.opencontainers.image.ref.name"]
+			ref := d.Annotations[refAnnotationKey]
 			if ref == "" {
 				log.Printf("skipping manifest with no ref annotation: %s", d.Digest)
 				return

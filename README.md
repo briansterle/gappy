@@ -1,6 +1,7 @@
 # gappy
 
-A fast, lightweight tool for packing container images and Helm charts into a portable OCI store and serving them in air-gapped environments.
+Packs container images and Helm charts into a portable OCI store, then serves
+them in an air-gapped environment. A faster, lighter alternative to hauler.
 
 ## Why gappy
 
@@ -13,9 +14,9 @@ A fast, lightweight tool for packing container images and Helm charts into a por
 | Skip cached artifacts | Yes (digest check) | Yes |
 | Hauler manifest support | Yes | Yes |
 
-The parallel download difference is significant in practice. Pulling a large image manifest with `-j 12` is typically 2-5x faster than hauler's sequential pull, which matters when you have hundreds of images and charts to pack before a release.
-
-gappy is purpose-built for a single job: pack images and charts on a connected machine, carry the store across the air gap, serve everything locally. It does not try to be a general-purpose artifact manager.
+`-j 12` on a large manifest is typically 2-5x faster than hauler's sequential
+pull. Otherwise gappy does one job: pack on a connected machine, carry the
+store across the gap, serve it locally.
 
 ## Install
 
@@ -30,7 +31,7 @@ bash build.sh
 cp gappy ~/bin/
 ```
 
-Requires Go 1.21+.
+Requires Go 1.25+.
 
 ## Commands
 
@@ -45,13 +46,13 @@ gappy join <out-dir> <disc-001> [disc-002 ...]             merge disc volumes in
 gappy version                                              print version info
 ```
 
-`-j N` controls parallel download workers (default: CPU count - 1). Hauler is single-threaded; `-j 12` or higher makes a material difference on large manifests.
+`-j N` sets parallel download workers (default: CPU count - 1).
 
 ## Workflow
 
 ### 1. Discover
 
-Scan a directory tree for container image references and Helm chart dependencies:
+Scan a directory tree for image and chart refs:
 
 ```bash
 gappy discover templates     # finds image refs → found-images.txt
@@ -67,7 +68,7 @@ gappy -j 12 pack hauler/hauler-image-manifest.yaml
 gappy -j 12 pack found-images.txt
 ```
 
-Images are stored in an OCI layout at `./store`.
+Images land in an OCI layout at `./store`.
 
 Hauler manifest format (`kind: Images`):
 
@@ -108,9 +109,11 @@ spec:
       repoURL: my-helm-repo-oci
 ```
 
-`repoURL` is a Helm repo alias name. gappy resolves aliases via `~/.config/helm/repositories.yaml` — the same file Helm itself uses. HTTP repos are downloaded as `.tgz` files; OCI repos are pulled into the OCI layout.
+`repoURL` is a Helm repo alias, resolved via `~/.config/helm/repositories.yaml`
+(the same file Helm itself uses). HTTP repos download as `.tgz`; OCI repos go
+into the OCI layout.
 
-Authentication for both image registries and Helm repos uses the same credentials:
+Image registries and Helm repos share the same credentials:
 
 ```bash
 export GAPPY_USER=myuser
@@ -124,7 +127,7 @@ gappy serve              # uses ./store
 gappy serve /path/store  # explicit path
 ```
 
-A single server on `:5000` handles everything:
+One server on `:5000` handles everything:
 
 | Path | Protocol | Content |
 |---|---|---|
@@ -132,63 +135,46 @@ A single server on `:5000` handles everything:
 | `/{repoName}/index.yaml` | Helm HTTP | Chart index |
 | `/{repoName}/{chart}-{version}.tgz` | Helm HTTP | Chart package |
 
-Helm HTTP repos are auto-discovered from subdirectories of `./store/helm/` at startup. In the air gap:
+Helm HTTP repos are auto-discovered from subdirectories of `./store/helm/` at
+startup. In the air gap:
 
 ```bash
 helm repo add my-helm-repo http://localhost:5000/my-helm-repo
 helm pull my-helm-repo/my-chart --version 1.2.3
 ```
 
-### 5. Split onto physical media
-
-When the air gap is crossed by physical media (DVD, Blu-ray), split the packed store into
-disc-sized volumes before burning:
-
-```bash
-# DVD-5 (4.7 GB discs)
-gappy split dvd
-
-# Blu-ray BD-25 (25 GB discs)
-gappy split bd25
-
-# Custom size
-gappy split 4.7GB ./store ./discs
-```
-
-Supported presets:
-
-| Flag | Rated capacity | Usable (after UDF overhead) |
-|---|---|---|
-| `dvd`   | 4.7 GB  | 4.4 GB  |
-| `dvd9`  | 8.5 GB  | 8.1 GB  |
-| `bd25`  | 25 GB   | 23.8 GB |
-| `bd50`  | 50 GB   | 47.5 GB |
-| `bd100` | 100 GB  | 95 GB   |
-
-Each `disc-NNN/` directory is a valid OCI layout — `gappy serve disc-001/` works
-directly from a mounted disc without rejoining. Blobs shared between images are
-de-duplicated within each disc, so shared base layers cost space only once per disc.
-
-To reassemble after transport:
-
-```bash
-gappy join merged-store /mnt/disc-001 /mnt/disc-002 /mnt/disc-003
-gappy serve merged-store
-```
-
-Blobs shared across discs are de-duplicated during join (hard-linked when on the same
-filesystem, copied cross-device). The joined store is identical to the original.
-
-### Pushing into the registry
-
-The `/v2/` endpoint accepts `docker push`, so you can add images to a running store from inside the air gap:
+**Pushing in.** The `/v2/` endpoint takes `docker push`, so you can add images
+to a running store from inside the air gap:
 
 ```bash
 docker tag myapp:v1 localhost:5000/myapp:v1
 docker push localhost:5000/myapp:v1
 ```
 
-Pushed blobs and manifests are written straight into the OCI layout (`blobs/` + `index.json`), so they persist across restarts and travel with the store — a pushed image is indistinguishable from a packed one. Single-arch images and multi-arch indexes are both supported. The registry serves plain HTTP on `localhost`, which Docker treats as insecure by default; no extra daemon config is needed.
+Pushed blobs land straight in the OCI layout, so they persist and travel with
+the store like any packed image — single-arch and multi-arch both work. The
+registry serves plain HTTP on `localhost`, which Docker treats as insecure by
+default, so no extra daemon config is needed.
+
+### 5. Split onto physical media
+
+For air gaps crossed by DVD/Blu-ray, split the store into disc-sized volumes:
+
+```bash
+gappy split dvd                    # DVD-5, 4.7 GB
+gappy split bd25                   # Blu-ray BD-25, 25 GB
+gappy split 4.7GB ./store ./discs  # custom size
+```
+
+Presets: `dvd`, `dvd9`, `bd25`, `bd50`, `bd100`. Each `disc-NNN/` is a valid
+OCI layout on its own — `gappy serve disc-001/` works straight off a disc.
+Blobs are de-duplicated both within and across discs.
+
+Reassemble after transport:
+
+```bash
+gappy join merged-store /mnt/disc-001 /mnt/disc-002 /mnt/disc-003
+```
 
 ## Store layout
 
@@ -205,7 +191,9 @@ store/
 
 ## Skip-if-cached
 
-`pack` and `pack-charts` check whether a blob already exists in the store before pulling. Re-running against an unchanged manifest is fast — only new or updated artifacts are downloaded.
+`pack` and `pack-charts` check the store for an existing blob (by digest)
+before pulling, so re-running against an unchanged manifest only downloads
+what's new.
 
 ## Version
 

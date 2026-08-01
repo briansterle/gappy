@@ -3,12 +3,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
 func cmdVerify(storeDir string) {
@@ -52,21 +53,11 @@ func cmdVerify(storeDir string) {
 	}
 
 	// Phase 2: walk index.json to find referenced and missing blobs.
-	idxPath := filepath.Join(storeDir, "index.json")
-	idxData, err := os.ReadFile(idxPath)
+	referenced, err := loadReferencedBlobs(storeDir, func(desc v1.Descriptor, err error) {
+		fmt.Printf("  WARNING  cannot enumerate %s: %v\n", splitRef(desc), err)
+	})
 	if err != nil {
-		log.Fatalf("read index.json: %v", err)
-	}
-	var storeIdx ociIndexJSON
-	if err := json.Unmarshal(idxData, &storeIdx); err != nil {
-		log.Fatalf("parse index.json: %v", err)
-	}
-
-	referenced := make(blobMap) // reuses split.go's blobMap + collectBlobsInto
-	for _, desc := range storeIdx.Manifests {
-		if err := collectBlobsInto(storeDir, desc, referenced); err != nil {
-			fmt.Printf("  WARNING  cannot enumerate %s: %v\n", splitRef(desc), err)
-		}
+		log.Fatalf("%v", err)
 	}
 
 	present := make(map[string]bool, len(entries))

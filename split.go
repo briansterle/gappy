@@ -54,6 +54,21 @@ func parseSplitSize(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
+const refAnnotationKey = "org.opencontainers.image.ref.name"
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 // blobMap maps sha256 hex digest → byte size.
 type blobMap map[string]int64
 
@@ -135,7 +150,7 @@ func collectBlobsInto(storeDir string, desc v1.Descriptor, out blobMap) error {
 
 func splitRef(desc v1.Descriptor) string {
 	if desc.Annotations != nil {
-		if r := desc.Annotations["org.opencontainers.image.ref.name"]; r != "" {
+		if r := desc.Annotations[refAnnotationKey]; r != "" {
 			return r
 		}
 	}
@@ -147,6 +162,29 @@ type ociIndexJSON struct {
 	SchemaVersion int             `json:"schemaVersion"`
 	MediaType     string          `json:"mediaType"`
 	Manifests     []v1.Descriptor `json:"manifests"`
+}
+
+// loadReferencedBlobs reads storeDir's index.json and walks every top-level
+// manifest to build the set of blobs still reachable from the store. warn, if
+// non-nil, is called once per manifest that can't be enumerated (e.g. a
+// missing or corrupt blob) rather than treating it as fatal.
+func loadReferencedBlobs(storeDir string, warn func(desc v1.Descriptor, err error)) (blobMap, error) {
+	idxData, err := os.ReadFile(filepath.Join(storeDir, "index.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read index.json: %w", err)
+	}
+	var storeIdx ociIndexJSON
+	if err := json.Unmarshal(idxData, &storeIdx); err != nil {
+		return nil, fmt.Errorf("parse index.json: %w", err)
+	}
+
+	referenced := make(blobMap)
+	for _, d := range storeIdx.Manifests {
+		if err := collectBlobsInto(storeDir, d, referenced); err != nil && warn != nil {
+			warn(d, err)
+		}
+	}
+	return referenced, nil
 }
 
 func writeDisc(storeDir, discDir string, vol *discVol, discIdx, total int) {

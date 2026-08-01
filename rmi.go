@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -91,20 +90,11 @@ func cmdRmi(storeDir, ref string) {
 // gcOrphanedBlobs deletes every blob under storeDir that is no longer
 // reachable from index.json, returning the bytes and blob count freed.
 func gcOrphanedBlobs(storeDir string) (freed int64, removed int, err error) {
-	idxData, err := os.ReadFile(filepath.Join(storeDir, "index.json"))
+	referenced, err := loadReferencedBlobs(storeDir, func(d v1.Descriptor, err error) {
+		log.Printf("warning: cannot enumerate %s: %v", splitRef(d), err)
+	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("read index.json: %w", err)
-	}
-	var storeIdx ociIndexJSON
-	if err := json.Unmarshal(idxData, &storeIdx); err != nil {
-		return 0, 0, fmt.Errorf("parse index.json: %w", err)
-	}
-
-	referenced := make(blobMap)
-	for _, d := range storeIdx.Manifests {
-		if err := collectBlobsInto(storeDir, d, referenced); err != nil {
-			log.Printf("warning: cannot enumerate %s: %v", splitRef(d), err)
-		}
+		return 0, 0, err
 	}
 
 	blobsDir := filepath.Join(storeDir, "blobs", "sha256")
