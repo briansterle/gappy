@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-VERSION=v1.1.0
+VERSION=$(git describe --tags --dirty --always 2>/dev/null || echo "dev")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "none")
 DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
