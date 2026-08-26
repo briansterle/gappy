@@ -329,6 +329,7 @@ func (s *storeWriter) persist(repo, ref, contentType string, body []byte) error 
 	if err := s.lyt.WriteBlob(hash, io.NopCloser(bytes.NewReader(body))); err != nil {
 		return err
 	}
+	_ = perm.chmodFile(filepath.Join(string(s.lyt), "blobs", hash.Algorithm, hash.Hex))
 
 	if _, err := v1.NewHash(ref); err == nil {
 		return nil // pushed by digest — a child manifest, no index entry needed
@@ -345,7 +346,11 @@ func (s *storeWriter) persist(repo, ref, contentType string, body []byte) error 
 	if err := s.lyt.RemoveDescriptors(match.Name(refName)); err != nil {
 		return err
 	}
-	return s.lyt.AppendDescriptor(desc)
+	if err := s.lyt.AppendDescriptor(desc); err != nil {
+		return err
+	}
+	_ = perm.chmodFile(filepath.Join(string(s.lyt), "index.json"))
+	return nil
 }
 
 // statusRecorder captures the response status so storeWriter only persists a

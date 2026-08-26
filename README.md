@@ -5,14 +5,18 @@ them in an air-gapped environment. A faster, lighter alternative to hauler.
 
 ## Why gappy
 
-| | gappy | hauler |
-|---|---|---|
-| Binary size | ~10 MB | ~100 MB |
-| Dependencies | `go-containerregistry` only | helm SDK, k8s client-go, ... |
-| Parallel downloads | Yes (`-j N`, default: CPU count) | No (single-threaded) |
-| Helm repo serving | Single port (OCI + HTTP) | Separate |
-| Skip cached artifacts | Yes (digest check) | Yes |
-| Hauler manifest support | Yes | Yes |
+| Capability | gappy | hauler | zarf | skopeo / crane |
+|---|---|---|---|---|
+| **Binary size** | ~10 MB | ~100 MB | ~150 MB+ | ~20–40 MB |
+| **Dependencies** | `go-containerregistry` only | Helm SDK, k8s client-go, ... | Custom runtime & CLI | Distribution tools |
+| **Parallel downloads** | Yes (`-j N`, default: CPU count - 1) | No (single-threaded) | Yes | Scripting required |
+| **Unified server (OCI + Helm HTTP)** | Yes (single port `:5000`) | Separate listeners | Multi-port | None (client only) |
+| **Delta diff against baseline** | Yes (`gappy diff`) | No | Differential pkg | No |
+| **In-place store merge** | Yes (`gappy merge`) | No | No | No |
+| **Physical media split / join** | Yes (`gappy split` / `join`) | No | Manual | No |
+| **Push-through airgap registry** | Yes (`docker push`) | Limited | Cluster registry | None |
+| **Skip cached artifacts** | Yes (digest check) | Yes | Yes | Yes |
+| **Hauler manifest support** | Yes (`kind: Images`, `kind: Charts`) | Yes | No | No |
 
 `-j 12` on a large manifest is typically 2-5x faster than hauler's sequential
 pull. Otherwise gappy does one job: pack on a connected machine, carry the
@@ -38,6 +42,7 @@ Requires Go 1.25+.
 ```
 gappy [-j N] pack <images.txt|manifest.yaml>               pack container images
 gappy [-j N] pack-charts <charts.txt|manifest.yaml>        pack Helm charts
+gappy diff <baseline|zip|dir> <manifest> [out]             filter manifest down to missing items
 gappy serve [store-path]                                   serve images + charts
 gappy discover [dir]                                       find image and chart refs
 gappy rmi <ref|digest> [store-path]                        remove an image and gc orphaned blobs
@@ -60,6 +65,15 @@ Scan a directory tree for image and chart refs:
 ```bash
 gappy discover templates     # finds image refs → found-images.txt
 gappy discover charts        # finds chart refs → found-charts.txt
+```
+
+### 1b. Diff (Incremental Building)
+
+Filter discovered lists against a baseline `.zip` archive or store directory:
+
+```bash
+gappy diff baseline.zip found-images.txt found-images.diff.txt
+gappy diff baseline.zip found-charts.txt found-charts.diff.txt
 ```
 
 ### 2. Pack images
