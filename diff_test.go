@@ -1,9 +1,16 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -331,6 +338,325 @@ func TestDiffFromZipStoreEntries(t *testing.T) {
 	}
 }
 
+// --- tar baselines ---
+
+func TestDiffFromTarGz(t *testing.T) {
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "baseline.tar.gz")
+	writeTarGz(t, tarPath, map[string]string{
+		"bundle/found-images.txt": "ubuntu:24.04\nnginx:alpine\n",
+	})
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "delta.txt")
+	writeFile(t, currFile, "ubuntu:24.04\nnginx:alpine\nredis:alpine\n")
+
+	cmdDiff(tarPath, currFile, outFile)
+
+	if got := strings.TrimSpace(string(readFile(t, outFile))); got != "redis:alpine" {
+		t.Errorf("got %q, want redis:alpine", got)
+	}
+}
+
+func TestDiffFromUncompressedTar(t *testing.T) {
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "baseline.tar")
+	writeTar(t, tarPath, map[string]string{"bundle/images.txt": "nginx:alpine\n"}, false)
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "delta.txt")
+	writeFile(t, currFile, "nginx:alpine\nredis:alpine\n")
+
+	cmdDiff(tarPath, currFile, outFile)
+
+	if got := strings.TrimSpace(string(readFile(t, outFile))); got != "redis:alpine" {
+		t.Errorf("got %q, want redis:alpine", got)
+	}
+}
+
+// TestTarAndZipAgree pins the property that made the two walkers worth sharing:
+// the same bundle keyed through either format yields the same key set.
+func TestTarAndZipAgree(t *testing.T) {
+	dir := t.TempDir()
+	members := map[string]string{
+		"bundle/store/index.json": `{"schemaVersion":2,"manifests":[{"digest":"sha256:` +
+			strings.Repeat("c", 64) + `","size":1,"annotations":{"org.opencontainers.image.ref.name":"nginx:alpine"}}]}`,
+		"bundle/helm/my-chart-1.0.0.tgz": "chart bytes",
+		"bundle/found-images.txt":        "redis:alpine\n",
+		"bundle/README.md":               "postgres:17 is not a key",
+	}
+
+	tarPath := filepath.Join(dir, "b.tar.gz")
+	zipPath := filepath.Join(dir, "b.zip")
+	writeTarGz(t, tarPath, members)
+	writeZip(t, zipPath, members)
+
+	fromTar, err := collectBaselineKeys(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromZip, err := collectBaselineKeys(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fromTar) != len(fromZip) {
+		t.Fatalf("tar keys %v != zip keys %v", fromTar, fromZip)
+	}
+	for k := range fromZip {
+		if !fromTar[k] {
+			t.Errorf("key %q present for zip but not tar", k)
+		}
+	}
+	for _, want := range []string{"nginx:alpine", "redis:alpine", "my-chart-1.0.0.tgz"} {
+		if !fromZip[want] {
+			t.Errorf("missing key %q", want)
+		}
+	}
+	if fromZip["postgres:17 is not a key"] {
+		t.Error("README lines must not become keys")
+	}
+}
+
+// --- remote baselines ---
+
+func TestDiffFromHTTPZipRanged(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "baseline.zip")
+	writeZip(t, zipPath, map[string]string{"bundle/found-images.txt": "ubuntu:24.04\nnginx:alpine\n"})
+
+	var ranged bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			ranged = true
+		}
+		http.ServeFile(w, r, zipPath)
+	}))
+	defer ts.Close()
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "delta.txt")
+	writeFile(t, currFile, "ubuntu:24.04\nnginx:alpine\npostgres:17-alpine\n")
+
+	cmdDiff(ts.URL+"/baseline.zip", currFile, outFile)
+
+	if got := strings.TrimSpace(string(readFile(t, outFile))); got != "postgres:17-alpine" {
+		t.Errorf("got %q, want postgres:17-alpine", got)
+	}
+	if !ranged {
+		t.Error("expected the remote zip to be read with range requests")
+	}
+}
+
+// TestDiffFromHTTPZipNoRangeSupport covers a server that declines ranges up
+// front. The probe sees Accept-Ranges: none and downloads the archive whole,
+// so the baseline is still read rather than the diff failing.
+func TestDiffFromHTTPZipNoRangeSupport(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "baseline.zip")
+	writeZip(t, zipPath, map[string]string{"bundle/found-images.txt": "ubuntu:24.04\nnginx:alpine\n"})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Ignore Range entirely, the way a naive proxy does.
+		w.Header().Set("Accept-Ranges", "none")
+		data, err := os.ReadFile(zipPath)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Length", itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}))
+	defer ts.Close()
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "delta.txt")
+	writeFile(t, currFile, "ubuntu:24.04\nnginx:alpine\npostgres:17-alpine\n")
+
+	cmdDiff(ts.URL+"/baseline.zip", currFile, outFile)
+
+	if got := strings.TrimSpace(string(readFile(t, outFile))); got != "postgres:17-alpine" {
+		t.Errorf("got %q, want postgres:17-alpine", got)
+	}
+}
+
+// TestDiffFromHTTPZipLyingRangeServer covers a server that advertises
+// Accept-Ranges: bytes and then ignores the Range header. The probe believes
+// it, so the guard has to be in the read itself: without it archive/zip is fed
+// the head of the file under every offset, and the diff fails outright.
+func TestDiffFromHTTPZipLyingRangeServer(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "baseline.zip")
+	writeZip(t, zipPath, map[string]string{"bundle/found-images.txt": "ubuntu:24.04\nnginx:alpine\n"})
+
+	data, err := os.ReadFile(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			w.Write(data)
+		}
+	}))
+	defer ts.Close()
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "delta.txt")
+	writeFile(t, currFile, "ubuntu:24.04\nnginx:alpine\npostgres:17-alpine\n")
+
+	cmdDiff(ts.URL+"/baseline.zip", currFile, outFile)
+
+	if got := strings.TrimSpace(string(readFile(t, outFile))); got != "postgres:17-alpine" {
+		t.Errorf("got %q, want postgres:17-alpine", got)
+	}
+}
+
+func TestDiffFromHTTPTarGz(t *testing.T) {
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "baseline.tar.gz")
+	writeTarGz(t, tarPath, map[string]string{"bundle/found-images.txt": "ubuntu:24.04\nnginx:alpine\n"})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, tarPath)
+	}))
+	defer ts.Close()
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "delta.txt")
+	writeFile(t, currFile, "ubuntu:24.04\nnginx:alpine\ngolang:1.24-alpine\n")
+
+	cmdDiff(ts.URL+"/baseline.tar.gz", currFile, outFile)
+
+	if got := strings.TrimSpace(string(readFile(t, outFile))); got != "golang:1.24-alpine" {
+		t.Errorf("got %q, want golang:1.24-alpine", got)
+	}
+}
+
+func TestRemoteBaselineSendsCredentials(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "baseline.zip")
+	writeZip(t, zipPath, map[string]string{"bundle/found-images.txt": "nginx:alpine\n"})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "svc" || pass != "s3cret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		http.ServeFile(w, r, zipPath)
+	}))
+	defer ts.Close()
+
+	t.Setenv("GAPPY_USER", "svc")
+	t.Setenv("GAPPY_PASS", "s3cret")
+
+	keys, err := collectBaselineKeys(ts.URL + "/baseline.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !keys["nginx:alpine"] {
+		t.Errorf("expected nginx:alpine in %v", keys)
+	}
+}
+
+// TestRemoteBaselineTokenOnlyAuth covers an Artifactory identity token, which
+// is sent as the password with no username.
+func TestRemoteBaselineTokenOnlyAuth(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "baseline.zip")
+	writeZip(t, zipPath, map[string]string{"bundle/found-images.txt": "nginx:alpine\n"})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pass, ok := r.BasicAuth(); !ok || pass != "tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		http.ServeFile(w, r, zipPath)
+	}))
+	defer ts.Close()
+
+	t.Setenv("GAPPY_USER", "")
+	t.Setenv("GAPPY_PASS", "tok")
+
+	keys, err := collectBaselineKeys(ts.URL + "/baseline.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !keys["nginx:alpine"] {
+		t.Errorf("expected nginx:alpine in %v", keys)
+	}
+}
+
+func TestRemoteBaselineUnauthorizedErrors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	t.Setenv("GAPPY_USER", "")
+	t.Setenv("GAPPY_PASS", "")
+	t.Setenv("RSART_LOCAL_USER", "")
+	t.Setenv("RSART_LOCAL_AUTH", "")
+
+	_, err := collectBaselineKeys(ts.URL + "/baseline.zip")
+	if err == nil {
+		t.Fatal("expected an error for 401")
+	}
+	if !strings.Contains(err.Error(), "GAPPY_USER") {
+		t.Errorf("error should name the auth env vars, got: %v", err)
+	}
+}
+
+func TestRedactURL(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"https://svc:s3cret@art.example.com/b.zip", "https://art.example.com/b.zip"},
+		{"https://art.example.com/b.zip?token=abc", "https://art.example.com/b.zip?..."},
+		{"https://art.example.com/b.zip", "https://art.example.com/b.zip"},
+	} {
+		u, err := url.Parse(tc.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := redactURL(u); got != tc.want {
+			t.Errorf("redactURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCredsFromURLUserinfoWins(t *testing.T) {
+	t.Setenv("GAPPY_USER", "env-user")
+	t.Setenv("GAPPY_PASS", "env-pass")
+
+	u, err := url.Parse("https://url-user:url-pass@art.example.com/b.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user, pass := credsFor(u); user != "url-user" || pass != "url-pass" {
+		t.Errorf("got %q/%q, want url-user/url-pass", user, pass)
+	}
+}
+
+func TestSizeFromContentRange(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want int64
+	}{
+		{"bytes 0-0/12345", 12345},
+		{"bytes 0-0/*", 0},
+		{"", 0},
+		{"garbage", 0},
+	} {
+		if got := sizeFromContentRange(tc.in); got != tc.want {
+			t.Errorf("sizeFromContentRange(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
 // --- helpers ---
 
 func writeFile(t *testing.T, path, content string) {
@@ -348,3 +674,71 @@ func readFile(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+func writeZip(t *testing.T, path string, members map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	zw := zip.NewWriter(f)
+	for name, content := range members {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTarGz(t *testing.T, path string, members map[string]string) {
+	t.Helper()
+	writeTar(t, path, members, true)
+}
+
+func writeTar(t *testing.T, path string, members map[string]string, gzipped bool) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	var w io.WriteCloser = nopWriteCloser{f}
+	if gzipped {
+		w = gzip.NewWriter(f)
+	}
+	tw := tar.NewWriter(w)
+	for name, content := range members {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Typeflag: tar.TypeReg,
+			Size:     int64(len(content)),
+			Mode:     0644,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }

@@ -1,17 +1,24 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -53,9 +60,13 @@ func isYAMLName(base string) bool {
 }
 
 // collectBaselineKeys extracts the reference keys already covered by a
-// baseline, which may be a .zip archive, an OCI store or directory tree, or a
-// single manifest file.
+// baseline, which may be an http(s) URL, a .zip/.tar/.tar.gz archive, an OCI
+// store or directory tree, or a single manifest file.
 func collectBaselineKeys(baselinePath string) (map[string]bool, error) {
+	if isHTTPURL(baselinePath) {
+		return collectKeysFromURL(baselinePath)
+	}
+
 	fi, err := os.Stat(baselinePath)
 	if err != nil {
 		return nil, fmt.Errorf("stat baseline %s: %w", baselinePath, err)
@@ -65,28 +76,70 @@ func collectBaselineKeys(baselinePath string) (map[string]bool, error) {
 	case fi.IsDir():
 		return collectKeysFromDir(baselinePath)
 	case strings.HasSuffix(baselinePath, ".zip"):
-		return collectKeysFromZip(baselinePath)
+		return collectKeysFromZipFile(baselinePath)
+	case isTarName(baselinePath):
+		return collectKeysFromTarFile(baselinePath)
 	default:
 		return collectKeysFromFile(baselinePath)
 	}
 }
 
-func collectKeysFromZip(zipPath string) (map[string]bool, error) {
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return nil, fmt.Errorf("open zip %s: %w", zipPath, err)
-	}
-	defer r.Close()
+// isTarName reports whether path names a tar stream, gzipped or not.
+func isTarName(path string) bool {
+	return strings.HasSuffix(path, ".tar") ||
+		strings.HasSuffix(path, ".tar.gz") ||
+		strings.HasSuffix(path, ".tgz")
+}
 
+// isGzipName reports whether a tar stream named path is gzipped. A bundle's
+// .tgz is a compressed tar; a chart's .tgz never reaches here, because
+// isHelmArchive claims it first.
+func isGzipName(path string) bool {
+	return strings.HasSuffix(path, ".tar.gz") || strings.HasSuffix(path, ".tgz")
+}
+
+// --- archive walking -------------------------------------------------------
+
+// archiveEntry is one member of a zip or tar, reduced to what key collection
+// needs: the path it was stored under, and a way to read it that the caller
+// may decline. Zip and tar disagree about almost everything else — random
+// access versus a single forward pass, decompression on open versus on the
+// stream — but the rule for which members carry keys is the same, so it lives
+// once in collectFromArchive.
+type archiveEntry struct {
+	name string
+	open func() (io.ReadCloser, error)
+}
+
+// maxEntryBytes caps how much of a single archive member is read into memory.
+// A manifest is kilobytes; anything at this size is a wrong guess about the
+// file, or a hostile archive, and either way is not worth the allocation.
+const maxEntryBytes = 32 << 20
+
+// collectFromArchive keys every member of an archive that carries refs. label
+// names the archive in warnings. next yields entries in order and returns
+// io.EOF when done; a nil entry is skipped.
+func collectFromArchive(label string, next func() (*archiveEntry, error)) (map[string]bool, error) {
 	keys := make(map[string]bool)
-	for _, f := range r.File {
-		base := filepath.Base(f.Name)
 
+	for {
+		e, err := next()
+		if err == io.EOF {
+			return keys, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", label, err)
+		}
+		if e == nil {
+			continue
+		}
+
+		base := path.Base(e.name)
 		switch {
 		case base == "index.json":
-			data, err := readZipEntry(f)
+			data, err := readEntry(e)
 			if err != nil {
-				log.Printf("warning: baseline %s!%s: %v", zipPath, f.Name, err)
+				log.Printf("warning: baseline %s!%s: %v", label, e.name, err)
 				continue
 			}
 			var idx ociIndexJSON
@@ -96,28 +149,405 @@ func collectKeysFromZip(zipPath string) (map[string]bool, error) {
 			}
 			collectFromOCIIndex(idx, keys)
 
-		case isHelmArchive(f.Name):
-			collectFromChartArchive(f.Name, keys)
+		case isHelmArchive(e.name):
+			collectFromChartArchive(e.name, keys)
 
 		case isPlainManifestName(base) || isYAMLName(base):
-			data, err := readZipEntry(f)
+			data, err := readEntry(e)
 			if err != nil {
-				log.Printf("warning: baseline %s!%s: %v", zipPath, f.Name, err)
+				log.Printf("warning: baseline %s!%s: %v", label, e.name, err)
 				continue
 			}
 			collectFromContent(data, keys, isPlainManifestName(base))
 		}
 	}
-	return keys, nil
 }
 
-func readZipEntry(f *zip.File) ([]byte, error) {
-	rc, err := f.Open()
+func readEntry(e *archiveEntry) ([]byte, error) {
+	rc, err := e.open()
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(rc)
+
+	data, err := io.ReadAll(io.LimitReader(rc, maxEntryBytes))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == maxEntryBytes {
+		return nil, fmt.Errorf("entry exceeds %s", humanBytes(maxEntryBytes))
+	}
+	return data, nil
+}
+
+func collectKeysFromZipFile(zipPath string) (map[string]bool, error) {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, fmt.Errorf("open zip %s: %w", zipPath, err)
+	}
+	defer r.Close()
+	return collectFromZipReader(zipPath, &r.Reader)
+}
+
+func collectFromZipReader(label string, r *zip.Reader) (map[string]bool, error) {
+	i := 0
+	return collectFromArchive(label, func() (*archiveEntry, error) {
+		if i >= len(r.File) {
+			return nil, io.EOF
+		}
+		f := r.File[i]
+		i++
+		if f.FileInfo().IsDir() {
+			return nil, nil
+		}
+		return &archiveEntry{name: f.Name, open: func() (io.ReadCloser, error) { return f.Open() }}, nil
+	})
+}
+
+func collectKeysFromTarFile(tarPath string) (map[string]bool, error) {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", tarPath, err)
+	}
+	defer f.Close()
+	return collectFromTarStream(tarPath, f, isGzipName(tarPath))
+}
+
+// collectFromTarStream reads a tar in a single forward pass. Unlike a zip it
+// has no central directory, so every byte crosses the wire even though only a
+// few members carry keys — which is why a remote .zip baseline is much cheaper
+// than a remote .tar.gz one.
+func collectFromTarStream(label string, r io.Reader, gzipped bool) (map[string]bool, error) {
+	if gzipped {
+		gr, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, fmt.Errorf("read gzip %s: %w", label, err)
+		}
+		defer gr.Close()
+		r = gr
+	}
+
+	tr := tar.NewReader(r)
+	return collectFromArchive(label, func() (*archiveEntry, error) {
+		hdr, err := tr.Next()
+		if err != nil {
+			return nil, err // io.EOF ends the walk
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			return nil, nil
+		}
+		// The entry is only readable until the next call to tr.Next, which is
+		// exactly the window collectFromArchive uses it in.
+		return &archiveEntry{name: hdr.Name, open: func() (io.ReadCloser, error) {
+			return io.NopCloser(tr), nil
+		}}, nil
+	})
+}
+
+// --- remote baselines ------------------------------------------------------
+
+// A baseline often lives in Artifactory rather than on disk. A zip there is
+// read over ranged GETs: archive/zip needs only the central directory at the
+// tail plus the few members that carry refs, so a 20GB bundle costs a few MB
+// to diff against. A tar has no central directory and must be streamed whole,
+// so prefer a .zip baseline URL when there's a choice.
+
+// errRangeUnsupported means the server answered a ranged GET with the entire
+// body. Reading that as the requested range would hand archive/zip the head of
+// the file under every offset, so the ranged reader refuses and the caller
+// downloads instead.
+var errRangeUnsupported = errors.New("server does not support range requests")
+
+func isHTTPURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+// credsFor resolves basic-auth credentials for u: the URL's own userinfo
+// first, then GAPPY_USER/GAPPY_PASS, then RSART_LOCAL_USER/RSART_LOCAL_AUTH.
+func credsFor(u *url.URL) (user, pass string) {
+	if u.User != nil {
+		pass, _ := u.User.Password()
+		return u.User.Username(), pass
+	}
+	if user, pass := os.Getenv("GAPPY_USER"), os.Getenv("GAPPY_PASS"); user != "" || pass != "" {
+		return user, pass
+	}
+	return os.Getenv("RSART_LOCAL_USER"), os.Getenv("RSART_LOCAL_AUTH")
+}
+
+// setAuth attaches credentials when there are any. Either half may be empty:
+// an Artifactory API key or identity token is commonly sent as the password
+// with no username, and requiring both would silently drop it.
+func setAuth(req *http.Request, user, pass string) {
+	if user != "" || pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+}
+
+// redactURL renders u for a log line or an error. Credentials reach gappy in
+// the URL itself often enough that echoing one back verbatim would leak it
+// into a build log, so userinfo is stripped and any query — where Artifactory
+// carries a token — is elided.
+func redactURL(u *url.URL) string {
+	clean := *u
+	clean.User = nil
+	if clean.RawQuery != "" {
+		clean.RawQuery = ""
+		return clean.String() + "?..."
+	}
+	return clean.String()
+}
+
+// baselineClient builds a client for baseline fetches. overall bounds the whole
+// exchange and so has to allow for the size of the body; responseHeaderTimeout
+// is what actually catches a dead or hanging server promptly.
+func baselineClient(overall time.Duration) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	return &http.Client{Transport: tr, Timeout: overall}
+}
+
+func newBaselineRequest(method string, u *url.URL, user, pass string) (*http.Request, error) {
+	req, err := http.NewRequest(method, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	setAuth(req, user, pass)
+	return req, nil
+}
+
+func collectKeysFromURL(rawURL string) (map[string]bool, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse baseline URL: %w", err)
+	}
+	user, pass := credsFor(u)
+
+	if isTarName(u.Path) {
+		return collectKeysFromRemoteTar(u, user, pass)
+	}
+	return collectKeysFromRemoteZip(u, user, pass)
+}
+
+func collectKeysFromRemoteTar(u *url.URL, user, pass string) (map[string]bool, error) {
+	label := redactURL(u)
+
+	// A tar is read start to finish, so the timeout has to cover the whole
+	// bundle rather than one small range.
+	req, err := newBaselineRequest(http.MethodGet, u, user, pass)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := baselineClient(30 * time.Minute).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get %s: %w", label, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get %s: %s", label, resp.Status)
+	}
+
+	log.Printf("streaming baseline %s (a tar has no index, so all of it is read)", label)
+	return collectFromTarStream(label, resp.Body, isGzipName(u.Path))
+}
+
+func collectKeysFromRemoteZip(u *url.URL, user, pass string) (map[string]bool, error) {
+	label := redactURL(u)
+	client := baselineClient(5 * time.Minute)
+
+	size, ranges, err := probeRemote(client, u, user, pass)
+	if err != nil {
+		return nil, err
+	}
+
+	if ranges && size > 0 {
+		keys, err := collectFromRangedZip(client, u, user, pass, label, size)
+		if err == nil {
+			return keys, nil
+		}
+		if !errors.Is(err, errRangeUnsupported) {
+			return nil, err
+		}
+		// The probe said ranges were available and the server then ignored
+		// one. Fall through to the download rather than fail.
+	}
+
+	log.Printf("baseline %s: no usable range support, downloading in full", label)
+	return collectKeysFromDownloadedZip(client, u, user, pass, label)
+}
+
+func collectFromRangedZip(client *http.Client, u *url.URL, user, pass, label string, size int64) (map[string]bool, error) {
+	r := &httpReaderAt{client: client, url: u, user: user, pass: pass, size: size}
+
+	zr, err := zip.NewReader(r, size)
+	if err != nil {
+		if errors.Is(err, errRangeUnsupported) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("read remote zip %s: %w", label, err)
+	}
+	return collectFromZipReader(label, zr)
+}
+
+func collectKeysFromDownloadedZip(client *http.Client, u *url.URL, user, pass, label string) (map[string]bool, error) {
+	req, err := newBaselineRequest(http.MethodGet, u, user, pass)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get %s: %w", label, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get %s: %s", label, resp.Status)
+	}
+
+	// archive/zip needs a ReaderAt, so this has to land somewhere seekable.
+	// A temp file rather than memory, because the whole point of the remote
+	// baseline is that these archives are large.
+	tmp, err := os.CreateTemp("", "gappy-baseline-*.zip")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		return nil, fmt.Errorf("download %s: %w", label, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+
+	keys, err := collectKeysFromZipFile(tmp.Name())
+	if err != nil {
+		// Don't name the temp file at the user, it's already gone.
+		return nil, fmt.Errorf("read downloaded baseline %s: %w", label, err)
+	}
+	return keys, nil
+}
+
+// probeRemote reports the size of the remote archive and whether the server
+// will serve ranges of it.
+func probeRemote(client *http.Client, u *url.URL, user, pass string) (size int64, ranges bool, err error) {
+	label := redactURL(u)
+
+	req, err := newBaselineRequest(http.MethodHead, u, user, pass)
+	if err != nil {
+		return 0, false, err
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return resp.ContentLength, strings.Contains(resp.Header.Get("Accept-Ranges"), "bytes"), nil
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return 0, false, fmt.Errorf("head %s: %s (set GAPPY_USER and GAPPY_PASS)", label, resp.Status)
+		}
+		// Some servers refuse HEAD outright; a one-byte range answers both
+		// questions at once.
+	}
+
+	req, err = newBaselineRequest(http.MethodGet, u, user, pass)
+	if err != nil {
+		return 0, false, err
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err = client.Do(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("get %s: %w", label, err)
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
+	resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		return sizeFromContentRange(resp.Header.Get("Content-Range")), true, nil
+	case http.StatusOK:
+		// Ranges ignored, so the size here is the whole archive.
+		return resp.ContentLength, false, nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return 0, false, fmt.Errorf("get %s: %s (set GAPPY_USER and GAPPY_PASS)", label, resp.Status)
+	default:
+		return 0, false, fmt.Errorf("get %s: %s", label, resp.Status)
+	}
+}
+
+// sizeFromContentRange pulls the total length out of "bytes 0-0/12345",
+// returning 0 for the "*" that means the server won't say.
+func sizeFromContentRange(v string) int64 {
+	_, total, ok := strings.Cut(v, "/")
+	if !ok {
+		return 0
+	}
+	var n int64
+	if _, err := fmt.Sscanf(total, "%d", &n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// httpReaderAt adapts ranged GETs to the io.ReaderAt that archive/zip wants.
+type httpReaderAt struct {
+	client *http.Client
+	url    *url.URL
+	user   string
+	pass   string
+	size   int64
+}
+
+func (h *httpReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if off < 0 || off >= h.size {
+		return 0, io.EOF
+	}
+
+	// Ranges are inclusive on both ends, and asking past the last byte makes
+	// some servers answer 416 instead of a short read.
+	end := off + int64(len(p)) - 1
+	if end >= h.size {
+		end = h.size - 1
+	}
+	want := int(end - off + 1)
+
+	req, err := newBaselineRequest(http.MethodGet, h.url, h.user, h.pass)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		// The body is the whole archive from byte 0. Copying it into p would
+		// satisfy the read with the wrong bytes and leave archive/zip parsing
+		// the head of the file as though it were the central directory.
+		return 0, errRangeUnsupported
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		return 0, fmt.Errorf("range %d-%d of %s: %s", off, end, redactURL(h.url), resp.Status)
+	}
+
+	n, err := io.ReadFull(resp.Body, p[:want])
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	if err == nil && n < len(p) {
+		// Clamped against the end of the archive: a short read, per the
+		// io.ReaderAt contract, needs an error saying why.
+		err = io.EOF
+	}
+	return n, err
 }
 
 func collectKeysFromDir(dirPath string) (map[string]bool, error) {

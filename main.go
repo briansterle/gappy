@@ -108,13 +108,13 @@ func main() {
 	}
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy diff <baseline-file|zip|dir> <current-file> [out-file]\n  gappy serve [store-path]\n  gappy discover [dir]\n  gappy rmi <ref|digest> [store-path]\n  gappy verify [store-path]\n  gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store] [out]\n  gappy join <out-dir> <disc-001> [disc-002 ...]\n  gappy merge [-n] <base-store> <store> [store ...]\n  gappy fix-perms [-n] [store-path]\n  gappy version")
+		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy diff <baseline|zip|tar|url|dir> <current-file> [out-file]\n  gappy serve [store-path]\n  gappy discover [dir]\n  gappy rmi <ref|digest> [store-path]\n  gappy verify [store-path]\n  gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store] [out]\n  gappy join <out-dir> <disc-001> [disc-002 ...]\n  gappy merge [-n] <base-store> <store> [store ...]\n  gappy fix-perms [-n] [store-path]\n  gappy version")
 	}
 
 	switch args[0] {
 	case "diff":
 		if len(args) < 3 {
-			log.Fatal("usage: gappy diff <baseline-file|zip|dir> <current-file> [out-file]")
+			log.Fatal("usage: gappy diff <baseline|zip|tar|url|dir> <current-file> [out-file]")
 		}
 		outFile := ""
 		if len(args) >= 4 {
