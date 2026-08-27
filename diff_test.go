@@ -1,7 +1,11 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -108,5 +112,137 @@ func TestDiffFromZip(t *testing.T) {
 	outStr := strings.TrimSpace(string(outBytes))
 	if outStr != "redis:alpine" {
 		t.Errorf("got %q, want redis:alpine", outStr)
+	}
+}
+
+func TestDiffFromTarGz(t *testing.T) {
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "baseline.tar.gz")
+
+	tf, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(tf)
+	tw := tar.NewWriter(gw)
+
+	content := "ubuntu:24.04\nnginx:alpine\n"
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "resolute-installer/sidecar-charts/found-images.txt",
+		Size: int64(len(content)),
+		Mode: 0644,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tw.Write([]byte(content))
+	tw.Close()
+	gw.Close()
+	tf.Close()
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "found-images.diff.txt")
+	if err := os.WriteFile(currFile, []byte("ubuntu:24.04\nnginx:alpine\nredis:alpine\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmdDiff(tarPath, currFile, outFile)
+
+	outBytes, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outStr := strings.TrimSpace(string(outBytes))
+	if outStr != "redis:alpine" {
+		t.Errorf("got %q, want redis:alpine", outStr)
+	}
+}
+
+func TestDiffFromHTTPTarGz(t *testing.T) {
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "remote-baseline.tar.gz")
+
+	tf, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(tf)
+	tw := tar.NewWriter(gw)
+
+	content := "ubuntu:24.04\nnginx:alpine\n"
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "resolute-installer/sidecar-charts/found-images.txt",
+		Size: int64(len(content)),
+		Mode: 0644,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tw.Write([]byte(content))
+	tw.Close()
+	gw.Close()
+	tf.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, tarPath)
+	}))
+	defer ts.Close()
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "found-images.diff.txt")
+	if err := os.WriteFile(currFile, []byte("ubuntu:24.04\nnginx:alpine\ngolang:1.24-alpine\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmdDiff(ts.URL+"/remote-baseline.tar.gz", currFile, outFile)
+
+	outBytes, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outStr := strings.TrimSpace(string(outBytes))
+	if outStr != "golang:1.24-alpine" {
+		t.Errorf("got %q, want golang:1.24-alpine", outStr)
+	}
+}
+
+func TestDiffFromHTTPZip(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "remote-baseline.zip")
+
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	w, err := zw.Create("resolute-installer/sidecar-charts/found-images.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write([]byte("ubuntu:24.04\nnginx:alpine\n"))
+	zw.Close()
+	zf.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, zipPath)
+	}))
+	defer ts.Close()
+
+	currFile := filepath.Join(dir, "found-images.txt")
+	outFile := filepath.Join(dir, "found-images.diff.txt")
+	if err := os.WriteFile(currFile, []byte("ubuntu:24.04\nnginx:alpine\npostgres:17-alpine\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmdDiff(ts.URL+"/remote-baseline.zip", currFile, outFile)
+
+	outBytes, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outStr := strings.TrimSpace(string(outBytes))
+	if outStr != "postgres:17-alpine" {
+		t.Errorf("got %q, want postgres:17-alpine", outStr)
 	}
 }

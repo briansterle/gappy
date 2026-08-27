@@ -1,17 +1,21 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,17 +26,143 @@ func normalizeImageKey(ref string) string {
 	return ref
 }
 
+type httpReaderAt struct {
+	client *http.Client
+	url    string
+	user   string
+	pass   string
+}
+
+func (h *httpReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	req, err := http.NewRequest(http.MethodGet, h.url, nil)
+	if err != nil {
+		return 0, err
+	}
+	if h.user != "" && h.pass != "" {
+		req.SetBasicAuth(h.user, h.pass)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1))
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HTTP %d for range %d-%d", resp.StatusCode, off, off+int64(len(p))-1)
+	}
+
+	return io.ReadFull(resp.Body, p)
+}
+
+func collectKeysFromHTTPZip(url string) (map[string]bool, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	user := os.Getenv("GAPPY_USER")
+	pass := os.Getenv("GAPPY_PASS")
+	if user == "" && pass == "" {
+		user = os.Getenv("RSART_LOCAL_USER")
+		pass = os.Getenv("RSART_LOCAL_AUTH")
+	}
+
+	req, err := http.NewRequest(http.MethodHead, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("head %s: %w", url, err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("head %s: HTTP %d", url, resp.StatusCode)
+	}
+	if resp.ContentLength <= 0 {
+		return nil, fmt.Errorf("head %s: missing or invalid Content-Length", url)
+	}
+
+	rAt := &httpReaderAt{
+		client: client,
+		url:    url,
+		user:   user,
+		pass:   pass,
+	}
+
+	zr, err := zip.NewReader(rAt, resp.ContentLength)
+	if err != nil {
+		return nil, fmt.Errorf("read remote zip %s: %w", url, err)
+	}
+
+	return collectKeysFromZipReader(zr)
+}
+
+func collectKeysFromHTTPTar(url string) (map[string]bool, error) {
+	client := &http.Client{Timeout: 10 * time.Minute}
+	user := os.Getenv("GAPPY_USER")
+	pass := os.Getenv("GAPPY_PASS")
+	if user == "" && pass == "" {
+		user = os.Getenv("RSART_LOCAL_USER")
+		pass = os.Getenv("RSART_LOCAL_AUTH")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get %s: HTTP %d", url, resp.StatusCode)
+	}
+
+	var r io.Reader = resp.Body
+	if strings.HasSuffix(url, ".tar.gz") || strings.HasSuffix(url, ".tgz") {
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read remote gzip %s: %w", url, err)
+		}
+		defer gr.Close()
+		r = gr
+	}
+
+	return collectKeysFromTarReader(tar.NewReader(r))
+}
+
 // collectBaselineKeys extracts known image and chart reference keys from a baseline
-// which can be a .zip archive, a directory, or a manifest file.
+// which can be a remote URL, a .zip/.tar/.tar.gz archive, a directory, or a manifest file.
 func collectBaselineKeys(baselinePath string) (map[string]bool, error) {
+	if strings.HasPrefix(baselinePath, "http://") || strings.HasPrefix(baselinePath, "https://") {
+		if strings.HasSuffix(baselinePath, ".tar.gz") || strings.HasSuffix(baselinePath, ".tgz") || strings.HasSuffix(baselinePath, ".tar") {
+			return collectKeysFromHTTPTar(baselinePath)
+		}
+		return collectKeysFromHTTPZip(baselinePath)
+	}
+
 	fi, err := os.Stat(baselinePath)
 	if err != nil {
 		return nil, fmt.Errorf("stat baseline %s: %w", baselinePath, err)
 	}
 
-	if !fi.IsDir() && (strings.HasSuffix(baselinePath, ".zip") || strings.HasSuffix(baselinePath, ".tar.gz")) {
+	if !fi.IsDir() {
 		if strings.HasSuffix(baselinePath, ".zip") {
 			return collectKeysFromZip(baselinePath)
+		}
+		if strings.HasSuffix(baselinePath, ".tar.gz") || strings.HasSuffix(baselinePath, ".tgz") {
+			return collectKeysFromTarGz(baselinePath)
+		}
+		if strings.HasSuffix(baselinePath, ".tar") {
+			return collectKeysFromTar(baselinePath)
 		}
 	}
 
@@ -43,6 +173,86 @@ func collectBaselineKeys(baselinePath string) (map[string]bool, error) {
 	return collectKeysFromFile(baselinePath)
 }
 
+func collectKeysFromTar(tarPath string) (map[string]bool, error) {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return nil, fmt.Errorf("open tar %s: %w", tarPath, err)
+	}
+	defer f.Close()
+	return collectKeysFromTarReader(tar.NewReader(f))
+}
+
+func collectKeysFromTarGz(tarGzPath string) (map[string]bool, error) {
+	f, err := os.Open(tarGzPath)
+	if err != nil {
+		return nil, fmt.Errorf("open tar.gz %s: %w", tarGzPath, err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("read gzip %s: %w", tarGzPath, err)
+	}
+	defer gr.Close()
+
+	return collectKeysFromTarReader(tar.NewReader(gr))
+}
+
+func collectKeysFromTarReader(tr *tar.Reader) (map[string]bool, error) {
+	keys := make(map[string]bool)
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		base := filepath.Base(hdr.Name)
+
+		// 1. Check index.json descriptors for image and OCI chart refs
+		if base == "index.json" {
+			data, err := io.ReadAll(tr)
+			if err == nil {
+				var idx ociIndexJSON
+				if err := json.Unmarshal(data, &idx); err == nil {
+					for _, d := range idx.Manifests {
+						if ref := d.Annotations[refAnnotationKey]; ref != "" {
+							keys[ref] = true
+							keys[normalizeImageKey(ref)] = true
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// 2. Check helm/*.tgz files
+		if strings.Contains(hdr.Name, "helm/") && strings.HasSuffix(hdr.Name, ".tgz") {
+			keys[base] = true
+			parts := strings.Split(hdr.Name, "helm/")
+			if len(parts) > 1 {
+				keys["helm/"+parts[1]] = true
+			}
+			nameVer := strings.TrimSuffix(base, ".tgz")
+			keys[nameVer] = true
+		}
+
+		// 3. Parse manifest text/yaml files embedded in the tar
+		if base == "found-images.txt" || base == "images.txt" || base == "found-charts.txt" ||
+			strings.HasSuffix(base, "-manifest.yaml") || strings.HasSuffix(base, "-manifest.yml") {
+			data, err := io.ReadAll(tr)
+			if err == nil {
+				extractKeysFromContent(base, data, keys)
+			}
+		}
+	}
+
+	return keys, nil
+}
+
 func collectKeysFromZip(zipPath string) (map[string]bool, error) {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -50,6 +260,10 @@ func collectKeysFromZip(zipPath string) (map[string]bool, error) {
 	}
 	defer r.Close()
 
+	return collectKeysFromZipReader(&r.Reader)
+}
+
+func collectKeysFromZipReader(r *zip.Reader) (map[string]bool, error) {
 	keys := make(map[string]bool)
 
 	for _, f := range r.File {
