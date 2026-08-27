@@ -333,9 +333,9 @@ what's new.
 
 ```bash
 gappy version    # or: gappy -v
-# gappy v1.1.0
-#   commit:  fd1c915
-#   built:   2026-08-26T13:58:01Z
+# gappy v1.2.0
+#   commit:  f14723f
+#   built:   2026-08-27T14:12:04Z
 #   go:      go1.26.3
 #   os/arch: linux/amd64
 ```
