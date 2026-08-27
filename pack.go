@@ -28,23 +28,30 @@ import (
 
 // --- manifests and refs ----------------------------------------------------
 
+// HaulerImage and HaulerChart are named rather than inlined into the manifest
+// structs so a filtered copy of Spec.Images or Spec.Charts can be built without
+// restating the field tags — gappy diff rewrites both.
+type HaulerImage struct {
+	Name    string `yaml:"name"`
+	Rewrite string `yaml:"rewrite"`
+}
+
+type HaulerChart struct {
+	Name    string `yaml:"name"`
+	Version string `yaml:"version"`
+	RepoURL string `yaml:"repoURL"`
+}
+
 type HaulerManifest struct {
 	Spec struct {
-		Images []struct {
-			Name    string `yaml:"name"`
-			Rewrite string `yaml:"rewrite"`
-		} `yaml:"images"`
+		Images []HaulerImage `yaml:"images"`
 	} `yaml:"spec"`
 }
 
 type HaulerChartManifest struct {
 	Kind string `yaml:"kind"`
 	Spec struct {
-		Charts []struct {
-			Name    string `yaml:"name"`
-			Version string `yaml:"version"`
-			RepoURL string `yaml:"repoURL"`
-		} `yaml:"charts"`
+		Charts []HaulerChart `yaml:"charts"`
 	} `yaml:"spec"`
 }
 

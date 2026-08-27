@@ -99,11 +99,7 @@ func TestLoadChartRefsFromHaulerWithRepos(t *testing.T) {
 	}
 
 	manifest := HaulerChartManifest{Kind: "Charts"}
-	manifest.Spec.Charts = []struct {
-		Name    string `yaml:"name"`
-		Version string `yaml:"version"`
-		RepoURL string `yaml:"repoURL"`
-	}{
+	manifest.Spec.Charts = []HaulerChart{
 		{Name: "my-chart", Version: "6.1.6", RepoURL: "my-helm-repo"},
 		{Name: "my-oci-chart", Version: "v1.14.0", RepoURL: "my-helm-repo-oci"},
 		{Name: "ghost-chart", Version: "1.0.0", RepoURL: "nonexistent"},

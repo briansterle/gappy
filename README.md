@@ -5,14 +5,18 @@ them in an air-gapped environment. A faster, lighter alternative to hauler.
 
 ## Why gappy
 
-| | gappy | hauler |
-|---|---|---|
-| Binary size | ~10 MB | ~100 MB |
-| Dependencies | `go-containerregistry` only | helm SDK, k8s client-go, ... |
-| Parallel downloads | Yes (`-j N`, default: CPU count) | No (single-threaded) |
-| Helm repo serving | Single port (OCI + HTTP) | Separate |
-| Skip cached artifacts | Yes (digest check) | Yes |
-| Hauler manifest support | Yes | Yes |
+| Capability | gappy | hauler | zarf | skopeo / crane |
+|---|---|---|---|---|
+| **Binary size** | ~10 MB | ~100 MB | ~150 MB+ | ~20–40 MB |
+| **Dependencies** | `go-containerregistry` only | Helm SDK, k8s client-go, ... | Custom runtime & CLI | Distribution tools |
+| **Parallel downloads** | Yes (`-j N`, default: CPU count - 1) | No (single-threaded) | Yes | Scripting required |
+| **Unified server (OCI + Helm HTTP)** | Yes (single port `:5000`) | Separate listeners | Multi-port | None (client only) |
+| **Delta diff against baseline** | Yes (`gappy diff`) | No | Differential pkg | No |
+| **In-place store merge** | Yes (`gappy merge`) | No | No | No |
+| **Physical media split / join** | Yes (`gappy split` / `join`) | No | Manual | No |
+| **Push-through airgap registry** | Yes (`docker push`) | Limited | Cluster registry | None |
+| **Skip cached artifacts** | Yes (digest check) | Yes | Yes | Yes |
+| **Hauler manifest support** | Yes (`kind: Images`, `kind: Charts`) | Yes | No | No |
 
 `-j 12` on a large manifest is typically 2-5x faster than hauler's sequential
 pull. Otherwise gappy does one job: pack on a connected machine, carry the
@@ -38,6 +42,7 @@ Requires Go 1.25+.
 ```
 gappy [-j N] pack <images.txt|manifest.yaml>               pack container images
 gappy [-j N] pack-charts <charts.txt|manifest.yaml>        pack Helm charts
+gappy diff <baseline|zip|tar|url|dir> <manifest> [out]     filter manifest down to missing items
 gappy serve [store-path]                                   serve images + charts
 gappy discover [dir]                                       find image and chart refs
 gappy rmi <ref|digest> [store-path]                        remove an image and gc orphaned blobs
@@ -61,6 +66,41 @@ Scan a directory tree for image and chart refs:
 gappy discover templates     # finds image refs → found-images.txt
 gappy discover charts        # finds chart refs → found-charts.txt
 ```
+
+### 1b. Diff (Incremental Building)
+
+Filter discovered lists down to what a baseline doesn't already carry, so a
+follow-up bundle ships only the delta:
+
+```bash
+gappy diff baseline.zip found-images.txt found-images.diff.txt
+gappy diff baseline.zip found-charts.txt found-charts.diff.txt
+```
+
+A baseline can be a `.zip`, a `.tar`/`.tar.gz`, a store or directory tree, a
+single manifest file, or an `http(s)` URL to any of those:
+
+```bash
+gappy diff https://artifactory.example.com/repo/baseline-1.4.0.zip \
+  found-images.txt found-images.diff.txt
+```
+
+A remote `.zip` is read with range requests — only the central directory and
+the few members holding refs cross the wire, so a large bundle costs a few MB
+to diff against. A `.tar.gz` has no central directory and must be streamed in
+full, so prefer a `.zip` URL when the baseline is published as both. If the
+server won't serve ranges, gappy downloads the archive and carries on.
+
+Baseline URLs use the same credentials as image registries and Helm repos
+(`GAPPY_USER` / `GAPPY_PASS`, below), falling back to `RSART_LOCAL_USER` /
+`RSART_LOCAL_AUTH`. Credentials embedded in the URL take precedence over both,
+and are stripped from anything gappy logs.
+
+The diff keeps blank lines and comments, so the output stays as readable as its
+input. An entry is dropped only on an exact match of one of the forms it can be
+written in — an unrecognized baseline is reported as covering nothing, and a
+warning says so, because over-shipping is recoverable and a silently missing
+image is not.
 
 ### 2. Pack images
 
@@ -116,12 +156,16 @@ spec:
 (the same file Helm itself uses). HTTP repos download as `.tgz`; OCI repos go
 into the OCI layout.
 
-Image registries and Helm repos share the same credentials:
+Image registries, Helm repos, and `gappy diff` baseline URLs share the same
+credentials:
 
 ```bash
 export GAPPY_USER=myuser
 export GAPPY_PASS=mypassword
 ```
+
+Either may be empty on its own — an Artifactory identity token is sent as the
+password with no username.
 
 ### 4. Serve
 
@@ -289,9 +333,9 @@ what's new.
 
 ```bash
 gappy version    # or: gappy -v
-# gappy v1.1.0
-#   commit:  fd1c915
-#   built:   2026-08-26T13:58:01Z
+# gappy v1.2.0
+#   commit:  f14723f
+#   built:   2026-08-27T14:12:04Z
 #   go:      go1.26.3
 #   os/arch: linux/amd64
 ```
