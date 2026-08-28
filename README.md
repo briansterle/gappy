@@ -42,7 +42,6 @@ Requires Go 1.25+.
 ```
 gappy [-j N] pack <images.txt|manifest.yaml>               pack container images
 gappy [-j N] pack-charts <charts.txt|manifest.yaml>        pack Helm charts
-gappy diff <baseline|zip|tar|url|dir> <manifest> [out]     filter manifest down to missing items
 gappy serve [store-path]                                   serve images + charts
 gappy discover [dir]                                       find image and chart refs
 gappy rmi <ref|digest> [store-path]                        remove an image and gc orphaned blobs
@@ -50,6 +49,7 @@ gappy verify [store-path]                                  check every blob agai
 gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store] [out]  split store into disc volumes
 gappy join <out-dir> <disc-001> [disc-002 ...]             merge disc volumes into a store
 gappy merge [-n] <base-store> <store> [store ...]          fold stores into base-store
+gappy diff <baseline|zip|tar|url|dir> <manifest> [out]     filter manifest down to missing items
 gappy fix-perms [-n] [store-path]                          repair store permissions
 gappy version                                              print version info
 ```
@@ -66,41 +66,6 @@ Scan a directory tree for image and chart refs:
 gappy discover templates     # finds image refs → found-images.txt
 gappy discover charts        # finds chart refs → found-charts.txt
 ```
-
-### 1b. Diff (Incremental Building)
-
-Filter discovered lists down to what a baseline doesn't already carry, so a
-follow-up bundle ships only the delta:
-
-```bash
-gappy diff baseline.zip found-images.txt found-images.diff.txt
-gappy diff baseline.zip found-charts.txt found-charts.diff.txt
-```
-
-A baseline can be a `.zip`, a `.tar`/`.tar.gz`, a store or directory tree, a
-single manifest file, or an `http(s)` URL to any of those:
-
-```bash
-gappy diff https://artifactory.example.com/repo/baseline-1.4.0.zip \
-  found-images.txt found-images.diff.txt
-```
-
-A remote `.zip` is read with range requests — only the central directory and
-the few members holding refs cross the wire, so a large bundle costs a few MB
-to diff against. A `.tar.gz` has no central directory and must be streamed in
-full, so prefer a `.zip` URL when the baseline is published as both. If the
-server won't serve ranges, gappy downloads the archive and carries on.
-
-Baseline URLs use the same credentials as image registries and Helm repos
-(`GAPPY_USER` / `GAPPY_PASS`, below), falling back to `RSART_LOCAL_USER` /
-`RSART_LOCAL_AUTH`. Credentials embedded in the URL take precedence over both,
-and are stripped from anything gappy logs.
-
-The diff keeps blank lines and comments, so the output stays as readable as its
-input. An entry is dropped only on an exact match of one of the forms it can be
-written in — an unrecognized baseline is reported as covering nothing, and a
-warning says so, because over-shipping is recoverable and a silently missing
-image is not.
 
 ### 2. Pack images
 
@@ -260,6 +225,38 @@ merged → ./store  (4 image(s) total)
 ```
 
 The replaced image's blobs stay on disk as orphans; `gappy verify` counts them.
+
+## Delta diffs
+
+Once a bundle has shipped, the next one usually only needs what changed.
+`gappy diff` filters a discovered manifest down to the entries a baseline
+doesn't already carry:
+
+```bash
+gappy diff baseline.zip found-images.txt found-images.diff.txt
+gappy diff baseline.zip found-charts.txt found-charts.diff.txt
+```
+
+Pack the filtered list as usual, then fold the result into the far-side store
+with [`gappy merge`](#6-merge-an-incremental-store).
+
+A baseline can be a `.zip`, a `.tar`/`.tar.gz`, a store or directory tree, a
+single manifest file, or an `http(s)` URL to any of those:
+
+```bash
+gappy diff https://artifactory.example.com/repo/baseline-1.4.0.zip \
+  found-images.txt found-images.diff.txt
+```
+
+Prefer a `.zip` URL when a baseline is published as both: a remote zip is read
+with range requests, so only its index and the few members holding refs cross
+the wire, while a `.tar.gz` has to be streamed in full. Baseline URLs take the
+same `GAPPY_USER` / `GAPPY_PASS` credentials as everything else, and any
+credentials in the URL itself are stripped from what gappy logs.
+
+An entry is dropped only on an exact match. A baseline gappy can't read is
+reported as covering nothing, with a warning — over-shipping is recoverable,
+a silently missing image is not.
 
 ## Store layout
 
