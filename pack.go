@@ -740,9 +740,7 @@ func downloadChart(client *http.Client, url, destDir, destPath, chartName, versi
 		os.Remove(destPath)
 		return
 	}
-	if err := perm.chmodFile(destPath); err != nil {
-		log.Printf("warning: chmod %s: %v", destPath, err)
-	}
+	perm.chmodFile(destPath)
 	log.Printf("downloaded %s:%s", chartName, version)
 }
 
@@ -771,8 +769,6 @@ func copyChart(src, destDir, destPath string) {
 		os.Remove(destPath)
 		return
 	}
-	if err := perm.chmodFile(destPath); err != nil {
-		log.Printf("warning: chmod %s: %v", destPath, err)
-	}
+	perm.chmodFile(destPath)
 	log.Printf("copied %s", filepath.Base(src))
 }

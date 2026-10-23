@@ -258,10 +258,7 @@ func (h *layoutBlobHandler) Put(ctx context.Context, repo string, hash v1.Hash, 
 	}
 	// os.CreateTemp is always 0600 whatever the umask, so a pushed blob has to
 	// be chmod'ed explicitly or nobody else can read what was pushed in.
-	if err := perm.chmodFile(tmp.Name()); err != nil {
-		os.Remove(tmp.Name())
-		return err
-	}
+	perm.chmodFile(tmp.Name())
 	return os.Rename(tmp.Name(), filepath.Join(dir, hash.Hex))
 }
 
@@ -329,7 +326,7 @@ func (s *storeWriter) persist(repo, ref, contentType string, body []byte) error 
 	if err := s.lyt.WriteBlob(hash, io.NopCloser(bytes.NewReader(body))); err != nil {
 		return err
 	}
-	_ = perm.chmodFile(filepath.Join(string(s.lyt), "blobs", hash.Algorithm, hash.Hex))
+	perm.chmodFile(filepath.Join(string(s.lyt), "blobs", hash.Algorithm, hash.Hex))
 
 	if _, err := v1.NewHash(ref); err == nil {
 		return nil // pushed by digest — a child manifest, no index entry needed
@@ -349,7 +346,7 @@ func (s *storeWriter) persist(repo, ref, contentType string, body []byte) error 
 	if err := s.lyt.AppendDescriptor(desc); err != nil {
 		return err
 	}
-	_ = perm.chmodFile(filepath.Join(string(s.lyt), "index.json"))
+	perm.chmodFile(filepath.Join(string(s.lyt), "index.json"))
 	return nil
 }
 

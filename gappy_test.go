@@ -495,6 +495,28 @@ func TestPermFileDropsSetgid(t *testing.T) {
 	}
 }
 
+// mkdirAll repairs an existing dir at the wrong mode. A chmod it can't make,
+// on a dir owned by another user, only logs a warning.
+func TestMkdirAllRepairsExistingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sha256")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (storePerm{dir: 0o755, file: 0o644}).mkdirAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Errorf("existing dir: got %04o, want 0755", got)
+	}
+}
+
 // useStore must set the process umask, because that is the only lever over
 // go-containerregistry, which writes blobs with os.Create and index.json with
 // os.ModePerm. Without it a umask-077 writer leaves a store nobody can read.

@@ -63,9 +63,7 @@ func writeStoreIndex(storeDir string, descs []v1.Descriptor) error {
 	if err := os.WriteFile(tmp, data, perm.file); err != nil {
 		return err
 	}
-	if err := perm.chmodFile(tmp); err != nil { // os.WriteFile is umask-filtered
-		return err
-	}
+	perm.chmodFile(tmp) // os.WriteFile is umask-filtered
 	if err := os.Rename(tmp, filepath.Join(storeDir, "index.json")); err != nil {
 		os.Remove(tmp)
 		return err
@@ -128,7 +126,8 @@ func writeStoreFile(path string, data []byte) error {
 	if err := os.WriteFile(path, data, perm.file); err != nil {
 		return err
 	}
-	return perm.chmodFile(path)
+	perm.chmodFile(path)
+	return nil
 }
 
 // loadReferencedBlobs reads storeDir's index.json and walks every top-level
@@ -179,7 +178,7 @@ func linkOrCopy(src, dst string) error {
 		if err == nil && fi.Mode().Perm() == perm.file.Perm() {
 			return nil
 		}
-		if err == nil && perm.chmodFile(dst) == nil {
+		if err == nil && os.Chmod(dst, perm.file) == nil {
 			return nil
 		}
 		os.Remove(dst)
@@ -209,9 +208,7 @@ func blobCopy(src, dst string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := perm.chmodFile(tmp.Name()); err != nil {
-		return err
-	}
+	perm.chmodFile(tmp.Name())
 	return os.Rename(tmp.Name(), dst)
 }
 
@@ -282,17 +279,30 @@ func (p storePerm) umask() int { return int(^p.dir.Perm()) & 0o777 }
 // the 0700 case that strands everyone but the owner.
 func (p storePerm) shutsOthersOut() bool { return p.dir.Perm()&0o044 == 0 }
 
-// chmodFile forces path to the policy's file mode. os.Chmod ignores the umask,
-// so this also corrects files made by os.CreateTemp, which is always 0600.
-func (p storePerm) chmodFile(path string) error { return os.Chmod(path, p.file) }
+// chmodBestEffort sets path to mode when it isn't there already. A failed
+// chmod only logs a warning. On a shared store the path may belong to another
+// user, and only its owner can chmod it. fix-perms reports those.
+func chmodBestEffort(path string, mode os.FileMode) {
+	if fi, err := os.Stat(path); err == nil && fi.Mode()&(os.ModePerm|os.ModeSetgid|os.ModeSetuid|os.ModeSticky) == mode {
+		return
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		log.Printf("warning: %v", err) // "chmod <path>: operation not permitted"
+	}
+}
 
-// mkdirAll creates dir and forces the policy mode on the leaf, so a setgid bit
+// chmodFile moves path to the policy's file mode. os.Chmod ignores the umask,
+// so this also corrects files made by os.CreateTemp, which is always 0600.
+func (p storePerm) chmodFile(path string) { chmodBestEffort(path, p.file) }
+
+// mkdirAll creates dir and moves the leaf to the policy mode, so a setgid bit
 // survives the umask.
 func (p storePerm) mkdirAll(dir string) error {
 	if err := os.MkdirAll(dir, p.dir); err != nil {
 		return err
 	}
-	return os.Chmod(dir, p.dir)
+	chmodBestEffort(dir, p.dir)
+	return nil
 }
 
 // normalizeStoreFiles fixes the modes of the store files gappy doesn't write
@@ -304,12 +314,10 @@ func normalizeStoreFiles(storeDir string) {
 		if _, err := os.Stat(path); err != nil {
 			continue
 		}
-		if err := perm.chmodFile(path); err != nil {
-			log.Printf("warning: chmod %s: %v", path, err)
-		}
+		perm.chmodFile(path)
 	}
 	if err := perm.mkdirAll(filepath.Join(storeDir, "blobs", "sha256")); err != nil {
-		log.Printf("warning: chmod blobs dir: %v", err)
+		log.Printf("warning: mkdir blobs dir: %v", err)
 	}
 }
 

@@ -858,9 +858,7 @@ func writeDiffOutput(data []byte, currentPath, outPath string, total, deltaCount
 	}
 	// os.WriteFile is subject to the umask; a manifest the next person can't
 	// read is the same trap fix-perms exists for.
-	if err := perm.chmodFile(tmp); err != nil {
-		log.Printf("warning: chmod %s: %v", tmp, err)
-	}
+	perm.chmodFile(tmp)
 	if err := os.Rename(tmp, outPath); err != nil {
 		os.Remove(tmp)
 		log.Fatalf("failed to rename output to %s: %v", outPath, err)
