@@ -25,8 +25,12 @@ store across the gap, serve it locally.
 ## Install
 
 ```bash
-go install github.com/briansterle/gappy@latest
+CGO_ENABLED=0 go install github.com/briansterle/gappy@latest
 ```
+
+`CGO_ENABLED=0` gives a static binary that runs on any Linux host, the same as
+`build.sh` produces. `go install` can't pick that up from the repo, so set it
+yourself.
 
 Or build from source:
 
@@ -43,6 +47,7 @@ Requires Go 1.25+.
 gappy [-j N] pack <images.txt|manifest.yaml>               pack container images
 gappy [-j N] pack-charts <charts.txt|manifest.yaml>        pack Helm charts
 gappy serve [store-path]                                   serve images + charts
+gappy [-j N] push [-n] <registry/prefix> [store-path]      push every image to a registry
 gappy discover [dir]                                       find image and chart refs
 gappy rmi <ref|digest> [store-path]                        remove an image and gc orphaned blobs
 gappy verify [store-path]                                  check every blob against its digest
@@ -54,7 +59,7 @@ gappy fix-perms [-n] [store-path]                          repair store permissi
 gappy version                                              print version info
 ```
 
-`-j N` sets parallel download workers (default: CPU count - 1).
+`-j N` sets parallel workers (default: CPU count - 1, or 4 for `push`).
 
 ## Workflow
 
@@ -257,6 +262,34 @@ credentials in the URL itself are stripped from what gappy logs.
 An entry is dropped only on an exact match. A baseline gappy can't read is
 reported as covering nothing, with a warning — over-shipping is recoverable,
 a silently missing image is not.
+
+## Pushing to a registry
+
+`gappy push` copies every image in a store into a real registry, such as an
+Artifactory Docker repo on the far side of the gap:
+
+```bash
+gappy push -n artifactory.company.org/dev-docker     # preview the mapping
+gappy push artifactory.company.org/dev-docker
+```
+
+`push` sends 4 images at a time by default, whatever the CPU count, because
+each image already uploads several blobs in parallel. Raise it with `-j` if
+the registry keeps up.
+
+Each image keeps the ref it was packed under, with the prefix in front.
+`gappy serve` exposes `nginx:alpine` as `localhost:5000/nginx:alpine`, and
+`push` sends it to `artifactory.company.org/dev-docker/nginx:alpine`. A ref
+that names its source registry keeps it as a path segment, so
+`registry.k8s.io/pause:3.9` lands at
+`artifactory.company.org/dev-docker/registry.k8s.io/pause:3.9`.
+
+Multi-arch images go over whole, and blobs the registry already holds are
+skipped, so a rerun only sends what's missing. OCI charts in the store go to
+the same repo. HTTP charts under `helm/` don't, so upload those to a Helm repo
+separately. `push` authenticates with `GAPPY_USER` / `GAPPY_PASS`, or with
+your Docker credentials when those aren't set. It exits non-zero if any image
+fails, listing the failed refs.
 
 ## Store layout
 

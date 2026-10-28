@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"io/fs"
@@ -423,26 +424,35 @@ func tgzRepoName(tgzPath string, repos []HelmRepository) string {
 
 // --- registry credentials --------------------------------------------------
 
-func makeAuthOption() crane.Option {
+// envAuth returns GAPPY_USER/GAPPY_PASS as an authenticator, or nil when both
+// are unset. Either half may be empty because an Artifactory identity token is
+// commonly sent as the password with no username.
+//
+// The pre-encoded Auth field carries the half-empty case. go-containerregistry
+// only builds a Basic header from Username and Password when both are set.
+func envAuth() authn.Authenticator {
 	user := os.Getenv("GAPPY_USER")
 	pass := os.Getenv("GAPPY_PASS")
-	if user != "" && pass != "" {
-		return crane.WithAuth(authn.FromConfig(authn.AuthConfig{
-			Username: user,
-			Password: pass,
-		}))
+	if user == "" && pass == "" {
+		return nil
+	}
+	return authn.FromConfig(authn.AuthConfig{
+		Username: user,
+		Password: pass,
+		Auth:     base64.StdEncoding.EncodeToString([]byte(user + ":" + pass)),
+	})
+}
+
+func makeAuthOption() crane.Option {
+	if a := envAuth(); a != nil {
+		return crane.WithAuth(a)
 	}
 	return crane.WithAuthFromKeychain(authn.DefaultKeychain)
 }
 
 func makeRemoteAuthOption() remote.Option {
-	user := os.Getenv("GAPPY_USER")
-	pass := os.Getenv("GAPPY_PASS")
-	if user != "" && pass != "" {
-		return remote.WithAuth(authn.FromConfig(authn.AuthConfig{
-			Username: user,
-			Password: pass,
-		}))
+	if a := envAuth(); a != nil {
+		return remote.WithAuth(a)
 	}
 	return remote.WithAuthFromKeychain(authn.DefaultKeychain)
 }
@@ -712,9 +722,7 @@ func downloadChart(client *http.Client, url, destDir, destPath, chartName, versi
 		log.Printf("failed to build request for %s: %v", url, err)
 		return
 	}
-	if user, pass := os.Getenv("GAPPY_USER"), os.Getenv("GAPPY_PASS"); user != "" && pass != "" {
-		req.SetBasicAuth(user, pass)
-	}
+	setAuth(req, os.Getenv("GAPPY_USER"), os.Getenv("GAPPY_PASS"))
 
 	resp, err := client.Do(req)
 	if err != nil {

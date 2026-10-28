@@ -369,6 +369,155 @@ func TestPushIndexPersistsChildBlobs(t *testing.T) {
 	}
 }
 
+func TestPushStoreRewritesPrefix(t *testing.T) {
+	dir := t.TempDir()
+	lyt, err := layout.Write(dir, empty.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	img, err := random.Image(1024, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := random.Index(1024, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := random.Image(512, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refAnn := func(ref string) layout.Option {
+		return layout.WithAnnotations(map[string]string{refAnnotationKey: ref})
+	}
+	if err := lyt.AppendImage(img, refAnn("registry.k8s.io/myapp:v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := lyt.AppendIndex(idx, refAnn("multi:v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := lyt.AppendImage(orphan); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(registry.New())
+	t.Cleanup(srv.Close)
+	prefix := strings.TrimPrefix(srv.URL, "http://") + "/dev-docker"
+
+	storeIdx, err := lyt.ImageIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushed, failed, err := pushStore(storeIdx, prefix, []name.Option{name.Insecure})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pushed != 2 || len(failed) != 0 {
+		t.Fatalf("pushed %d, failed %v; want 2 pushed, none failed", pushed, failed)
+	}
+
+	// Each ref lands under the prefix with its digest intact. The entry with no
+	// ref name is skipped.
+	for ref, want := range map[string]v1.Hash{
+		"registry.k8s.io/myapp:v1": mustDigest(t, img),
+		"multi:v1":                 mustDigest(t, idx),
+	} {
+		got, err := crane.Digest(prefix+"/"+ref, crane.Insecure)
+		if err != nil {
+			t.Fatalf("%s missing under prefix: %v", ref, err)
+		}
+		if got != want.String() {
+			t.Fatalf("%s digest = %s, want %s", ref, got, want)
+		}
+	}
+}
+
+// newTokenAuthRegistry serves a registry behind Artifactory-style token auth.
+// Registry calls need a bearer token, and /token hands one out only for the
+// given basic credentials.
+func newTokenAuthRegistry(t *testing.T, user, pass string) string {
+	t.Helper()
+	reg := registry.New()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			u, p, ok := r.BasicAuth()
+			if !ok || u != user || p != pass {
+				http.Error(w, "bad credentials", http.StatusUnauthorized)
+				return
+			}
+			fmt.Fprint(w, `{"token":"t0k"}`)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer t0k" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token",service="test"`, srv.URL))
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		reg.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+func TestPushStoreEnvCredentials(t *testing.T) {
+	dir := t.TempDir()
+	lyt, err := layout.Write(dir, empty.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := random.Image(256, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lyt.AppendImage(img, layout.WithAnnotations(map[string]string{refAnnotationKey: "app:v1"})); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := lyt.ImageIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Each case sets GAPPY_USER/GAPPY_PASS and checks whether the registry,
+	// which wants exactly the credentials in want, takes the push.
+	cases := []struct {
+		name         string
+		user, pass   string
+		wantU, wantP string
+		wantPushed   bool
+	}{
+		{"both", "svc", "s3cret", "svc", "s3cret", true},
+		{"password only", "", "tok", "", "tok", true},
+		{"user only", "svc", "", "svc", "", true},
+		{"wrong password", "svc", "nope", "svc", "s3cret", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("GAPPY_USER", c.user)
+			t.Setenv("GAPPY_PASS", c.pass)
+			host := newTokenAuthRegistry(t, c.wantU, c.wantP)
+
+			pushed, failed, err := pushStore(idx, host+"/dev-docker", []name.Option{name.Insecure}, makeRemoteAuthOption())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := pushed == 1 && len(failed) == 0; got != c.wantPushed {
+				t.Fatalf("pushed %d, failed %v; want pushed=%v", pushed, failed, c.wantPushed)
+			}
+		})
+	}
+}
+
+func mustDigest(t *testing.T, w interface{ Digest() (v1.Hash, error) }) v1.Hash {
+	t.Helper()
+	h, err := w.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
 // --- build info ------------------------------------------------------------
 
 func TestBuildStampFallback(t *testing.T) {

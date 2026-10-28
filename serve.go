@@ -14,12 +14,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -434,69 +434,140 @@ func cmdServe(storePath string) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	idxManifest, err := idx.IndexManifest()
+	log.Printf("loading store into registry...")
+	_, failed, err := pushStore(idx, addr, []name.Option{name.Insecure})
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	log.Printf("loading %d manifests into registry...", len(idxManifest.Manifests))
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, jobs)
-
-	for _, desc := range idxManifest.Manifests {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(d v1.Descriptor) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			ref := d.Annotations[refAnnotationKey]
-			if ref == "" {
-				log.Printf("skipping manifest with no ref annotation: %s", d.Digest)
-				return
-			}
-
-			dest := fmt.Sprintf("%s/%s", addr, ref)
-
-			switch d.MediaType {
-			case types.OCIImageIndex, types.DockerManifestList:
-				childIdx, err := idx.ImageIndex(d.Digest)
-				if err != nil {
-					log.Printf("failed to load index %s: %v", ref, err)
-					return
-				}
-				destRef, err := name.ParseReference(dest, name.Insecure)
-				if err != nil {
-					log.Printf("failed to parse dest %s: %v", dest, err)
-					return
-				}
-				if err := remote.WriteIndex(destRef, childIdx); err != nil {
-					log.Printf("failed to push index %s into registry: %v", ref, err)
-					return
-				}
-			default:
-				img, err := idx.Image(d.Digest)
-				if err != nil {
-					log.Printf("failed to load image %s: %v", ref, err)
-					return
-				}
-				if err := crane.Push(img, dest, crane.Insecure); err != nil {
-					log.Printf("failed to push %s into registry: %v", ref, err)
-					return
-				}
-			}
-
-			log.Printf("loaded %s", ref)
-		}(desc)
+	if len(failed) > 0 {
+		log.Printf("%d image(s) failed to load: %s", len(failed), strings.Join(failed, ", "))
 	}
-
-	wg.Wait()
 
 	// Replay finished: start recording genuine client pushes into the store.
 	sw.ready.Store(true)
 	log.Printf("registry ready on %s — accepting docker push", addr)
 
 	select {}
+}
+
+// --- push to a registry ----------------------------------------------------
+
+// pushStore writes every ref-named entry of idx to prefix/<ref>, jobs at a
+// time. It returns how many landed and which refs failed. Multi-arch indexes
+// go over whole, and blobs the registry already holds are skipped.
+func pushStore(idx v1.ImageIndex, prefix string, nameOpts []name.Option, opts ...remote.Option) (int, []string, error) {
+	im, err := idx.IndexManifest()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		pushed int
+		failed []string
+	)
+	sem := make(chan struct{}, jobs)
+
+	for _, d := range im.Manifests {
+		ref := d.Annotations[refAnnotationKey]
+		if ref == "" {
+			log.Printf("skipping manifest with no ref annotation: %s", d.Digest)
+			continue
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			dest := prefix + "/" + ref
+			err := pushDescriptor(idx, d, dest, nameOpts, opts)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				log.Printf("push failed %s: %v", ref, err)
+				failed = append(failed, ref)
+				return
+			}
+			log.Printf("pushed %s → %s", ref, dest)
+			pushed++
+		}()
+	}
+
+	wg.Wait()
+	slices.Sort(failed)
+	return pushed, failed, nil
+}
+
+// pushDescriptor writes the image or index d points at to dest.
+func pushDescriptor(idx v1.ImageIndex, d v1.Descriptor, dest string, nameOpts []name.Option, opts []remote.Option) error {
+	destRef, err := name.ParseReference(dest, nameOpts...)
+	if err != nil {
+		return err
+	}
+	switch d.MediaType {
+	case types.OCIImageIndex, types.DockerManifestList:
+		child, err := idx.ImageIndex(d.Digest)
+		if err != nil {
+			return err
+		}
+		return remote.WriteIndex(destRef, child, opts...)
+	default:
+		img, err := idx.Image(d.Digest)
+		if err != nil {
+			return err
+		}
+		return remote.Write(destRef, img, opts...)
+	}
+}
+
+// cmdPush copies every image in the store to a remote registry. A ref that
+// serve exposes as localhost:5000/<ref> lands at <prefix>/<ref>, so
+// artifactory.company.org/dev-docker turns nginx:alpine into
+// artifactory.company.org/dev-docker/nginx:alpine.
+func cmdPush(prefix, storePath string, dryRun bool) {
+	var nameOpts []name.Option
+	if strings.HasPrefix(prefix, "http://") {
+		nameOpts = append(nameOpts, name.Insecure)
+	}
+	prefix = strings.TrimPrefix(prefix, "http://")
+	prefix = strings.TrimPrefix(prefix, "https://")
+	prefix = strings.TrimSuffix(prefix, "/")
+	if _, err := name.NewRepository(prefix, nameOpts...); err != nil {
+		log.Fatalf("bad registry prefix %q: %v", prefix, err)
+	}
+
+	idx, err := layout.ImageIndexFromPath(storePath)
+	if err != nil {
+		log.Fatalf("failed to load store: %v", err)
+	}
+
+	if dryRun {
+		im, err := idx.IndexManifest()
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, d := range im.Manifests {
+			if ref := d.Annotations[refAnnotationKey]; ref != "" {
+				fmt.Printf("  %s → %s/%s\n", ref, prefix, ref)
+			}
+		}
+		return
+	}
+
+	pushed, failed, err := pushStore(idx, prefix, nameOpts, makeRemoteAuthOption())
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("\npushed %d image(s) to %s\n", pushed, prefix)
+	if len(failed) > 0 {
+		fmt.Printf("failed %d:\n", len(failed))
+		for _, ref := range failed {
+			fmt.Printf("  %s\n", ref)
+		}
+		os.Exit(1)
+	}
 }

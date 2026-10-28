@@ -5,6 +5,10 @@ COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "none")
 DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 export GOTMPDIR=~/tmp
+
+# Static binary with no libc dependency, so it runs on any Linux host.
+export CGO_ENABLED=0
+
 go test ./... || exit 1
 
 GOOS=linux GOARCH=amd64 go build \

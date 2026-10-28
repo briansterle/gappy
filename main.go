@@ -91,12 +91,28 @@ func cmdVersion() {
 
 var jobs int
 
+// pushJobs caps push's default -j. Each image already uploads 4 blobs at
+// once, so CPU count on a big box would open hundreds of uploads against one
+// registry.
+const pushJobs = 4
+
 var showVersion bool
 
 func init() {
 	flag.IntVar(&jobs, "j", max(1, runtime.NumCPU()-1), "parallel jobs")
 	flag.BoolVar(&showVersion, "version", false, "print version info and exit")
 	flag.BoolVar(&showVersion, "v", false, "print version info and exit")
+}
+
+// flagSet reports whether the named flag was given on the command line.
+func flagSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func main() {
@@ -108,7 +124,7 @@ func main() {
 	}
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy diff <baseline|zip|tar|url|dir> <current-file> [out-file]\n  gappy serve [store-path]\n  gappy discover [dir]\n  gappy rmi <ref|digest> [store-path]\n  gappy verify [store-path]\n  gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store] [out]\n  gappy join <out-dir> <disc-001> [disc-002 ...]\n  gappy merge [-n] <base-store> <store> [store ...]\n  gappy fix-perms [-n] [store-path]\n  gappy version")
+		log.Fatal("usage:\n  gappy [-j N] pack <images.txt|manifest.yaml>\n  gappy [-j N] pack-charts <found-charts.txt|manifest.yaml>\n  gappy diff <baseline|zip|tar|url|dir> <current-file> [out-file]\n  gappy serve [store-path]\n  gappy [-j N] push [-n] <registry/prefix> [store-path]\n  gappy discover [dir]\n  gappy rmi <ref|digest> [store-path]\n  gappy verify [store-path]\n  gappy split <dvd|dvd9|bd25|bd50|bd100|SIZE> [store] [out]\n  gappy join <out-dir> <disc-001> [disc-002 ...]\n  gappy merge [-n] <base-store> <store> [store ...]\n  gappy fix-perms [-n] [store-path]\n  gappy version")
 	}
 
 	switch args[0] {
@@ -137,6 +153,19 @@ func main() {
 			storePath = args[1]
 		}
 		cmdServe(storePath)
+	case "push":
+		rest, dryRun := extractDryRun(args[1:])
+		if len(rest) < 1 {
+			log.Fatal("usage: gappy push [-n] <registry/prefix> [store-path]")
+		}
+		storeDir := "./store"
+		if len(rest) >= 2 {
+			storeDir = rest[1]
+		}
+		if !flagSet("j") {
+			jobs = pushJobs
+		}
+		cmdPush(rest[0], storeDir, dryRun)
 	case "discover":
 		root := "."
 		if len(args) >= 2 {
@@ -192,6 +221,6 @@ func main() {
 	case "version":
 		cmdVersion()
 	default:
-		log.Fatalf("unknown command %q — use pack, pack-charts, diff, serve, discover, rmi, verify, split, join, merge, fix-perms, or version", args[0])
+		log.Fatalf("unknown command %q — use pack, pack-charts, diff, serve, push, discover, rmi, verify, split, join, merge, fix-perms, or version", args[0])
 	}
 }
