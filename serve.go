@@ -5,14 +5,18 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -25,7 +29,10 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/match"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"gopkg.in/yaml.v3"
 )
@@ -65,9 +72,20 @@ func readChartYamlFromTgz(path string) (*ChartMeta, error) {
 	}
 	defer f.Close()
 
-	gr, err := gzip.NewReader(f)
+	meta, _, err := readChartYaml(f)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return meta, nil
+}
+
+// readChartYaml parses the top-level Chart.yaml in a chart .tgz stream and
+// returns its raw bytes too. Subcharts carry their own Chart.yaml one level
+// deeper, under charts/.
+func readChartYaml(r io.Reader) (*ChartMeta, []byte, error) {
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, nil, err
 	}
 	defer gr.Close()
 
@@ -78,17 +96,23 @@ func readChartYamlFromTgz(path string) (*ChartMeta, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if filepath.Base(hdr.Name) == "Chart.yaml" {
-			var meta ChartMeta
-			if err := yaml.NewDecoder(tr).Decode(&meta); err != nil {
-				return nil, err
-			}
-			return &meta, nil
+		p := path.Clean(hdr.Name)
+		if path.Base(p) != "Chart.yaml" || strings.Count(p, "/") != 1 {
+			continue
 		}
+		raw, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, nil, err
+		}
+		var meta ChartMeta
+		if err := yaml.Unmarshal(raw, &meta); err != nil {
+			return nil, nil, err
+		}
+		return &meta, raw, nil
 	}
-	return nil, fmt.Errorf("Chart.yaml not found in %s", path)
+	return nil, nil, errors.New("Chart.yaml not found")
 }
 
 func sha256OfFile(path string) (string, error) {
@@ -435,7 +459,7 @@ func cmdServe(storePath string) {
 	time.Sleep(100 * time.Millisecond)
 
 	log.Printf("loading store into registry...")
-	_, failed, err := pushStore(idx, addr, []name.Option{name.Insecure})
+	_, failed, err := pushStore(idx, addr, false, []name.Option{name.Insecure})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -454,8 +478,9 @@ func cmdServe(storePath string) {
 
 // pushStore writes every ref-named entry of idx to prefix/<ref>, jobs at a
 // time. It returns how many landed and which refs failed. Multi-arch indexes
-// go over whole, and blobs the registry already holds are skipped.
-func pushStore(idx v1.ImageIndex, prefix string, nameOpts []name.Option, opts ...remote.Option) (int, []string, error) {
+// go over whole, and blobs the registry already holds are skipped. With
+// skipCharts, OCI charts stay behind for a Helm repo.
+func pushStore(idx v1.ImageIndex, prefix string, skipCharts bool, nameOpts []name.Option, opts ...remote.Option) (int, []string, error) {
 	im, err := idx.IndexManifest()
 	if err != nil {
 		return 0, nil, err
@@ -473,6 +498,9 @@ func pushStore(idx v1.ImageIndex, prefix string, nameOpts []name.Option, opts ..
 		ref := d.Annotations[refAnnotationKey]
 		if ref == "" {
 			log.Printf("skipping manifest with no ref annotation: %s", d.Digest)
+			continue
+		}
+		if skipCharts && isChart(idx, d) {
 			continue
 		}
 
@@ -528,7 +556,10 @@ func pushDescriptor(idx v1.ImageIndex, d v1.Descriptor, dest string, nameOpts []
 // serve exposes as localhost:5000/<ref> lands at <prefix>/<ref>, so
 // artifactory.company.org/dev-docker turns nginx:alpine into
 // artifactory.company.org/dev-docker/nginx:alpine.
-func cmdPush(prefix, storePath string, dryRun bool) {
+//
+// With helmRepo set, every chart goes there too, and OCI charts stay out of
+// the image push.
+func cmdPush(prefix, helmRepo, storePath string, dryRun bool) {
 	var nameOpts []name.Option
 	if strings.HasPrefix(prefix, "http://") {
 		nameOpts = append(nameOpts, name.Insecure)
@@ -540,9 +571,23 @@ func cmdPush(prefix, storePath string, dryRun bool) {
 		log.Fatalf("bad registry prefix %q: %v", prefix, err)
 	}
 
+	var target *chartTarget
+	if helmRepo != "" {
+		var err error
+		if target, err = parseChartTarget(helmRepo); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	idx, err := layout.ImageIndexFromPath(storePath)
 	if err != nil {
 		log.Fatalf("failed to load store: %v", err)
+	}
+
+	var charts []storeChart
+	var problems []string
+	if target != nil {
+		charts, problems = collectCharts(storePath, idx)
 	}
 
 	if dryRun {
@@ -551,23 +596,450 @@ func cmdPush(prefix, storePath string, dryRun bool) {
 			log.Fatal(err)
 		}
 		for _, d := range im.Manifests {
-			if ref := d.Annotations[refAnnotationKey]; ref != "" {
-				fmt.Printf("  %s → %s/%s\n", ref, prefix, ref)
+			ref := d.Annotations[refAnnotationKey]
+			if ref == "" || target != nil && isChart(idx, d) {
+				continue
 			}
+			fmt.Printf("  %s → %s/%s\n", ref, prefix, ref)
+		}
+		for _, c := range charts {
+			fmt.Printf("  %s → %s\n", c.source, target.dest(c))
+		}
+		for _, p := range problems {
+			fmt.Printf("  ! %s\n", p)
 		}
 		return
 	}
 
-	pushed, failed, err := pushStore(idx, prefix, nameOpts, makeRemoteAuthOption())
+	pushed, failed, err := pushStore(idx, prefix, target != nil, nameOpts, makeRemoteAuthOption())
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("\npushed %d image(s) to %s\n", pushed, prefix)
+
+	if target != nil {
+		pushed, existed, chartFailed := pushCharts(charts, target)
+		fmt.Printf("pushed %d chart(s) to %s, %d already there\n", pushed, target, existed)
+		failed = append(failed, problems...)
+		failed = append(failed, chartFailed...)
+	}
+
 	if len(failed) > 0 {
 		fmt.Printf("failed %d:\n", len(failed))
-		for _, ref := range failed {
-			fmt.Printf("  %s\n", ref)
+		for _, f := range failed {
+			fmt.Printf("  %s\n", f)
 		}
 		os.Exit(1)
 	}
+}
+
+// --- push charts -----------------------------------------------------------
+
+// Media types of a Helm chart stored as an OCI artifact, as `helm push`
+// writes one.
+const (
+	helmConfigMediaType types.MediaType = "application/vnd.cncf.helm.config.v1+json"
+	helmChartMediaType  types.MediaType = "application/vnd.cncf.helm.chart.content.v1.tar+gzip"
+)
+
+// storeChart is one chart in the store, from a .tgz under helm/ or an OCI
+// chart in index.json.
+type storeChart struct {
+	name, version string
+	source        string // store path or ref, for messages
+	tgz           []byte
+	chartYAML     []byte
+	img           v1.Image // the OCI artifact as packed; nil for a helm/ chart
+}
+
+func (c storeChart) file() string { return c.name + "-" + c.version + ".tgz" }
+
+func (c storeChart) sha256() string {
+	sum := sha256.Sum256(c.tgz)
+	return hex.EncodeToString(sum[:])
+}
+
+func newStoreChart(source string, tgz []byte) (storeChart, error) {
+	meta, raw, err := readChartYaml(bytes.NewReader(tgz))
+	if err != nil {
+		return storeChart{}, err
+	}
+	if meta.Name == "" || meta.Version == "" {
+		return storeChart{}, errors.New("Chart.yaml has no name or version")
+	}
+	return storeChart{name: meta.Name, version: meta.Version, source: source, tgz: tgz, chartYAML: raw}, nil
+}
+
+// isChart reports whether d is a Helm chart stored as an OCI artifact.
+func isChart(idx v1.ImageIndex, d v1.Descriptor) bool {
+	if d.MediaType == types.OCIImageIndex || d.MediaType == types.DockerManifestList {
+		return false
+	}
+	img, err := idx.Image(d.Digest)
+	if err != nil {
+		return false
+	}
+	m, err := img.Manifest()
+	return err == nil && m.Config.MediaType == helmConfigMediaType
+}
+
+// chartLayer returns the chart .tgz layer of a Helm OCI artifact.
+func chartLayer(img v1.Image) (v1.Layer, error) {
+	m, err := img.Manifest()
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range m.Layers {
+		if l.MediaType == helmChartMediaType {
+			return img.LayerByDigest(l.Digest)
+		}
+	}
+	return nil, errors.New("no chart layer")
+}
+
+func ociStoreChart(idx v1.ImageIndex, d v1.Descriptor, ref string) (storeChart, error) {
+	img, err := idx.Image(d.Digest)
+	if err != nil {
+		return storeChart{}, err
+	}
+	layer, err := chartLayer(img)
+	if err != nil {
+		return storeChart{}, err
+	}
+	rc, err := layer.Compressed()
+	if err != nil {
+		return storeChart{}, err
+	}
+	defer rc.Close()
+	tgz, err := io.ReadAll(rc)
+	if err != nil {
+		return storeChart{}, err
+	}
+	c, err := newStoreChart(ref, tgz)
+	c.img = img
+	return c, err
+}
+
+// collectCharts gathers every chart in the store, one per name and version.
+// Charts it can't read come back as problems. So does a name and version that
+// two sources carry with different content, since one Helm repo can only hold
+// one of them. Problem charts aren't pushed.
+func collectCharts(storePath string, idx v1.ImageIndex) ([]storeChart, []string) {
+	var all []storeChart
+	var problems []string
+
+	files, _ := filepath.Glob(filepath.Join(storePath, "helm", "*", "*.tgz"))
+	for _, f := range files {
+		source, _ := filepath.Rel(storePath, f)
+		tgz, err := os.ReadFile(f)
+		if err == nil {
+			var c storeChart
+			if c, err = newStoreChart(source, tgz); err == nil {
+				all = append(all, c)
+				continue
+			}
+		}
+		problems = append(problems, fmt.Sprintf("%s: %v", source, err))
+	}
+
+	im, err := idx.IndexManifest()
+	if err != nil {
+		return nil, append(problems, fmt.Sprintf("index.json: %v", err))
+	}
+	for _, d := range im.Manifests {
+		ref := d.Annotations[refAnnotationKey]
+		if ref == "" || !isChart(idx, d) {
+			continue
+		}
+		c, err := ociStoreChart(idx, d, ref)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", ref, err))
+			continue
+		}
+		all = append(all, c)
+	}
+
+	byFile := map[string][]storeChart{}
+	for _, c := range all {
+		byFile[c.file()] = append(byFile[c.file()], c)
+	}
+	var charts []storeChart
+	for file, cs := range byFile {
+		var sources []string
+		same := true
+		for _, c := range cs {
+			sources = append(sources, c.source)
+			same = same && bytes.Equal(c.tgz, cs[0].tgz)
+		}
+		if !same {
+			problems = append(problems, fmt.Sprintf("%s differs between %s", file, strings.Join(sources, " and ")))
+			continue
+		}
+		charts = append(charts, cs[0])
+	}
+
+	slices.SortFunc(charts, func(a, b storeChart) int { return strings.Compare(a.file(), b.file()) })
+	slices.Sort(problems)
+	return charts, problems
+}
+
+// chartTarget is where push --helm sends charts. A classic Helm repo takes
+// each .tgz over HTTP at <deploy>/<name>-<version>.tgz. A Helm OCI repo takes
+// each chart as an artifact at <oci>/<name>:<version>. Both are flat.
+type chartTarget struct {
+	deploy     *url.URL
+	user, pass string
+	client     *http.Client
+
+	oci        string
+	nameOpts   []name.Option
+	remoteOpts []remote.Option
+}
+
+// parseChartTarget reads a --helm URL. oci:// means a Helm OCI repo and
+// http(s):// a classic one. Artifactory serves a classic repo to clients at
+// /api/helm/<repo> but takes deploys at /<repo>, so either form works.
+func parseChartTarget(raw string) (*chartTarget, error) {
+	if rest, ok := strings.CutPrefix(raw, "oci://"); ok {
+		prefix := strings.TrimSuffix(rest, "/")
+		if _, err := name.NewRepository(prefix); err != nil {
+			return nil, fmt.Errorf("bad Helm OCI repo %q: %v", raw, err)
+		}
+		return &chartTarget{oci: prefix, remoteOpts: []remote.Option{makeRemoteAuthOption()}}, nil
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, errors.New("bad Helm repo URL: want https://... for a classic repo or oci://... for an OCI one")
+	}
+	u.Path = strings.Replace(strings.TrimSuffix(u.Path, "/"), "/api/helm/", "/", 1)
+	u.RawPath = ""
+	user, pass := credsFor(u)
+	u.User = nil
+	return &chartTarget{deploy: u, user: user, pass: pass, client: makeHTTPClient()}, nil
+}
+
+func (t *chartTarget) String() string {
+	if t.deploy != nil {
+		return redactURL(t.deploy)
+	}
+	return "oci://" + t.oci
+}
+
+func (t *chartTarget) dest(c storeChart) string {
+	if t.deploy != nil {
+		return redactURL(t.deploy.JoinPath(c.file()))
+	}
+	return t.oci + "/" + c.name + ":" + ociTag(c.version)
+}
+
+// ociTag turns a chart version into a tag. Tags can't hold "+", so Helm
+// writes semver build metadata with "_" instead.
+func ociTag(version string) string { return strings.ReplaceAll(version, "+", "_") }
+
+// push sends c to the target. It reports existed when the target already
+// holds the same chart, and fails rather than overwrite a different one.
+func (t *chartTarget) push(c storeChart) (existed bool, err error) {
+	if t.deploy != nil {
+		return t.pushHTTP(c)
+	}
+	return t.pushOCI(c)
+}
+
+func (t *chartTarget) pushHTTP(c storeChart) (bool, error) {
+	u := t.deploy.JoinPath(c.file())
+	sum256 := c.sha256()
+	sha1Sum := sha1.Sum(c.tgz)
+	sum1 := hex.EncodeToString(sha1Sum[:])
+
+	head, err := http.NewRequest(http.MethodHead, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	setAuth(head, t.user, t.pass)
+	resp, err := t.client.Do(head)
+	if err != nil {
+		return false, err
+	}
+	resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if sameChecksum(resp.Header, sum256, sum1) {
+			return true, nil
+		}
+		return false, errors.New("the repo already holds a different archive under this name")
+	case http.StatusNotFound:
+	default:
+		return false, httpStatusError("HEAD", u, resp)
+	}
+
+	put, err := http.NewRequest(http.MethodPut, u.String(), bytes.NewReader(c.tgz))
+	if err != nil {
+		return false, err
+	}
+	setAuth(put, t.user, t.pass)
+
+	// Artifactory checks the upload against these and rejects a mismatch.
+	put.Header.Set("X-Checksum-Sha256", sum256)
+	put.Header.Set("X-Checksum-Sha1", sum1)
+
+	resp, err = t.client.Do(put)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return false, httpStatusError("PUT", u, resp)
+	}
+	return false, nil
+}
+
+// sameChecksum compares Artifactory's checksum headers with ours, using the
+// strongest one it sent.
+func sameChecksum(h http.Header, sum256, sum1 string) bool {
+	if got := h.Get("X-Checksum-Sha256"); got != "" {
+		return strings.EqualFold(got, sum256)
+	}
+	if got := h.Get("X-Checksum-Sha1"); got != "" {
+		return strings.EqualFold(got, sum1)
+	}
+	return false
+}
+
+func httpStatusError(method string, u *url.URL, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	msg := fmt.Sprintf("%s %s: %s", method, redactURL(u), resp.Status)
+	if b := strings.TrimSpace(string(body)); b != "" {
+		msg += ": " + b
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		msg += " (set GAPPY_USER and GAPPY_PASS)"
+	}
+	return errors.New(msg)
+}
+
+func (t *chartTarget) pushOCI(c storeChart) (bool, error) {
+	ref, err := name.ParseReference(t.dest(c), t.nameOpts...)
+	if err != nil {
+		return false, err
+	}
+
+	var terr *transport.Error
+	existing, err := remote.Image(ref, t.remoteOpts...)
+	switch {
+	case err == nil:
+		layer, err := chartLayer(existing)
+		if err != nil {
+			return false, err
+		}
+		d, err := layer.Digest()
+		if err != nil {
+			return false, err
+		}
+		if d.Hex == c.sha256() {
+			return true, nil
+		}
+		return false, errors.New("the repo already holds a different chart under this tag")
+	case errors.As(err, &terr) && terr.StatusCode == http.StatusNotFound:
+	default:
+		return false, err
+	}
+
+	img := c.img
+	if img == nil {
+		if img, err = chartArtifact(c); err != nil {
+			return false, err
+		}
+	}
+	return false, remote.Write(ref, img, t.remoteOpts...)
+}
+
+// chartArtifact wraps a chart .tgz as a Helm OCI artifact, laid out the way
+// `helm push` writes one. The config is Chart.yaml as JSON.
+func chartArtifact(c storeChart) (v1.Image, error) {
+	var meta map[string]any
+	if err := yaml.Unmarshal(c.chartYAML, &meta); err != nil {
+		return nil, err
+	}
+	config, err := json.Marshal(meta)
+	if err != nil {
+		return nil, err
+	}
+	configDigest, configSize, err := v1.SHA256(bytes.NewReader(config))
+	if err != nil {
+		return nil, err
+	}
+	layer := static.NewLayer(c.tgz, helmChartMediaType)
+	layerDigest, err := layer.Digest()
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := json.Marshal(v1.Manifest{
+		SchemaVersion: 2,
+		MediaType:     types.OCIManifestSchema1,
+		Config:        v1.Descriptor{MediaType: helmConfigMediaType, Size: configSize, Digest: configDigest},
+		Layers:        []v1.Descriptor{{MediaType: helmChartMediaType, Size: int64(len(c.tgz)), Digest: layerDigest}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return partial.CompressedToImage(&chartImage{config: config, manifest: manifest, layer: layer})
+}
+
+// chartImage is the minimal image core partial needs to make a v1.Image.
+type chartImage struct {
+	config, manifest []byte
+	layer            v1.Layer
+}
+
+func (i *chartImage) MediaType() (types.MediaType, error) { return types.OCIManifestSchema1, nil }
+func (i *chartImage) RawConfigFile() ([]byte, error)      { return i.config, nil }
+func (i *chartImage) RawManifest() ([]byte, error)        { return i.manifest, nil }
+
+func (i *chartImage) LayerByDigest(h v1.Hash) (partial.CompressedLayer, error) {
+	if d, err := i.layer.Digest(); err == nil && d == h {
+		return i.layer, nil
+	}
+	return nil, fmt.Errorf("chart artifact has no layer %s", h)
+}
+
+// pushCharts sends each chart to t, jobs at a time. It returns how many went
+// up, how many t already held, and which charts failed and why.
+func pushCharts(charts []storeChart, t *chartTarget) (int, int, []string) {
+	var (
+		wg              sync.WaitGroup
+		mu              sync.Mutex
+		pushed, existed int
+		failed          []string
+	)
+	sem := make(chan struct{}, jobs)
+
+	for _, c := range charts {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			had, err := t.push(c)
+
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				log.Printf("push failed %s: %v", c.file(), err)
+				failed = append(failed, fmt.Sprintf("%s: %v", c.file(), err))
+			case had:
+				log.Printf("up-to-date, skipping %s", c.file())
+				existed++
+			default:
+				log.Printf("pushed %s → %s", c.source, t.dest(c))
+				pushed++
+			}
+		}()
+	}
+
+	wg.Wait()
+	slices.Sort(failed)
+	return pushed, existed, failed
 }

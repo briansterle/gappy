@@ -47,7 +47,7 @@ Requires Go 1.25+.
 gappy [-j N] pack <images.txt|manifest.yaml>               pack container images
 gappy [-j N] pack-charts <charts.txt|manifest.yaml>        pack Helm charts
 gappy serve [store-path]                                   serve images + charts
-gappy [-j N] push [-n] <registry/prefix> [store-path]      push every image to a registry
+gappy [-j N] push [-n] [--helm <url>] <prefix> [store]     push images (and charts) to a registry
 gappy discover [dir]                                       find image and chart refs
 gappy rmi <ref|digest> [store-path]                        remove an image and gc orphaned blobs
 gappy verify [store-path]                                  check every blob against its digest
@@ -57,6 +57,7 @@ gappy merge [-n] <base-store> <store> [store ...]          fold stores into base
 gappy diff <baseline|zip|tar|url|dir> <manifest> [out]     filter manifest down to missing items
 gappy fix-perms [-n] [store-path]                          repair store permissions
 gappy version                                              print version info
+gappy help                                                 print help (also -h, --help)
 ```
 
 `-j N` sets parallel workers (default: CPU count - 1, or 4 for `push`).
@@ -285,11 +286,42 @@ that names its source registry keeps it as a path segment, so
 `artifactory.company.org/dev-docker/registry.k8s.io/pause:3.9`.
 
 Multi-arch images go over whole, and blobs the registry already holds are
-skipped, so a rerun only sends what's missing. OCI charts in the store go to
-the same repo. HTTP charts under `helm/` don't, so upload those to a Helm repo
-separately. `push` authenticates with `GAPPY_USER` / `GAPPY_PASS`, or with
-your Docker credentials when those aren't set. It exits non-zero if any image
-fails, listing the failed refs.
+skipped, so a rerun only sends what's missing. `push` authenticates with
+`GAPPY_USER` / `GAPPY_PASS`, or with your Docker credentials when neither is
+set. It exits non-zero if anything fails, listing what did.
+
+### Helm charts
+
+`--helm` also sends every chart in the store to a Helm repo. That covers the
+`.tgz` charts under `helm/` and the OCI charts in `index.json`.
+
+```bash
+gappy push --helm https://artifactory.company.org/artifactory/api/helm/dev-helm \
+  artifactory.company.org/dev-docker
+```
+
+The URL's scheme picks the kind of repo:
+
+| `--helm` | Repo | Each chart lands at |
+|---|---|---|
+| `https://…/artifactory/dev-helm` | Classic Helm repo | `…/dev-helm/<name>-<version>.tgz` |
+| `oci://artifactory.company.org/dev-helm` | Helm OCI repo | `…/dev-helm/<name>:<version>` |
+
+- A classic repo takes either the URL `helm repo add` uses
+  (`/artifactory/api/helm/dev-helm`) or the deploy URL
+  (`/artifactory/dev-helm`). Artifactory rebuilds `index.yaml` after each
+  upload.
+- Both layouts are flat. Charts from different source repos share one
+  namespace, as they do in any Helm index.
+- OCI charts become plain `.tgz` files in a classic repo. `.tgz` charts become
+  Helm OCI artifacts in an OCI repo, with `+` in a version written as `_` in
+  the tag, the same as `helm push`.
+- A chart the repo already holds with the same content is skipped. One it
+  holds with different content fails rather than being overwritten.
+- Two sources in the store that carry the same chart name and version with
+  different content fail before anything uploads. `-n` shows them too.
+- With `--helm`, OCI charts go only to the Helm repo, not to the image
+  registry.
 
 ## Store layout
 

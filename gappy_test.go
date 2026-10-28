@@ -4,13 +4,18 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -29,11 +34,22 @@ import (
 // makeTestChart writes a minimal valid Helm .tgz into dir and returns its path.
 func makeTestChart(t *testing.T, dir, name, version string) string {
 	t.Helper()
+	path := filepath.Join(dir, fmt.Sprintf("%s-%s.tgz", name, version))
+	if err := os.WriteFile(path, chartTgz(t, name, version, "test chart"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// chartTgz builds a minimal Helm .tgz. The same arguments always give the same
+// bytes, and a different description gives different ones.
+func chartTgz(t *testing.T, name, version, description string) []byte {
+	t.Helper()
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gw)
 
-	chartYaml := fmt.Sprintf("apiVersion: v2\nname: %s\nversion: %s\ndescription: test chart\n", name, version)
+	chartYaml := fmt.Sprintf("apiVersion: v2\nname: %s\nversion: %s\ndescription: %s\n", name, version, description)
 	if err := tw.WriteHeader(&tar.Header{
 		Name: name + "/Chart.yaml",
 		Size: int64(len(chartYaml)),
@@ -46,12 +62,7 @@ func makeTestChart(t *testing.T, dir, name, version string) string {
 	}
 	tw.Close()
 	gw.Close()
-
-	path := filepath.Join(dir, fmt.Sprintf("%s-%s.tgz", name, version))
-	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	return buf.Bytes()
 }
 
 // --- resolveHelmAlias ---
@@ -409,7 +420,7 @@ func TestPushStoreRewritesPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pushed, failed, err := pushStore(storeIdx, prefix, []name.Option{name.Insecure})
+	pushed, failed, err := pushStore(storeIdx, prefix, false, []name.Option{name.Insecure})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +509,7 @@ func TestPushStoreEnvCredentials(t *testing.T) {
 			t.Setenv("GAPPY_PASS", c.pass)
 			host := newTokenAuthRegistry(t, c.wantU, c.wantP)
 
-			pushed, failed, err := pushStore(idx, host+"/dev-docker", []name.Option{name.Insecure}, makeRemoteAuthOption())
+			pushed, failed, err := pushStore(idx, host+"/dev-docker", false, []name.Option{name.Insecure}, makeRemoteAuthOption())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -516,6 +527,302 @@ func mustDigest(t *testing.T, w interface{ Digest() (v1.Hash, error) }) v1.Hash 
 		t.Fatal(err)
 	}
 	return h
+}
+
+// --- push charts -----------------------------------------------------------
+
+// newChartStore builds a store with helm/<repo>/ charts, keyed "repo/file",
+// OCI charts keyed by ref, and one ordinary image tagged app:v1.
+func newChartStore(t *testing.T, httpCharts, ociCharts map[string][]byte) (string, v1.ImageIndex) {
+	t.Helper()
+	dir := t.TempDir()
+	lyt, err := layout.Write(dir, empty.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, tgz := range httpCharts {
+		path := filepath.Join(dir, "helm", key)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, tgz, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for ref, tgz := range ociCharts {
+		c, err := newStoreChart(ref, tgz)
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, err := chartArtifact(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lyt.AppendImage(img, layout.WithAnnotations(map[string]string{refAnnotationKey: ref})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	img, err := random.Image(256, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lyt.AppendImage(img, layout.WithAnnotations(map[string]string{refAnnotationKey: "app:v1"})); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := lyt.ImageIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, idx
+}
+
+// fakeArtifactory serves a classic Helm repo's deploy API at
+// /artifactory/dev-helm/. HEAD answers with checksum headers, and PUT checks
+// X-Checksum-Sha256 against the body, as Artifactory does.
+type fakeArtifactory struct {
+	mu    sync.Mutex
+	files map[string][]byte
+	puts  int
+}
+
+func newFakeArtifactory(t *testing.T, user, pass string) (*fakeArtifactory, string) {
+	t.Helper()
+	fa := &fakeArtifactory{files: map[string][]byte{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if u, p, ok := r.BasicAuth(); !ok || u != user || p != pass {
+			http.Error(w, "bad credentials", http.StatusUnauthorized)
+			return
+		}
+		file, ok := strings.CutPrefix(r.URL.Path, "/artifactory/dev-helm/")
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		fa.mu.Lock()
+		defer fa.mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			data, ok := fa.files[file]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			s256 := sha256.Sum256(data)
+			w.Header().Set("X-Checksum-Sha256", hex.EncodeToString(s256[:]))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			s256 := sha256.Sum256(body)
+			if r.Header.Get("X-Checksum-Sha256") != hex.EncodeToString(s256[:]) {
+				http.Error(w, "checksum mismatch", http.StatusConflict)
+				return
+			}
+			fa.files[file] = body
+			fa.puts++
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return fa, srv.URL
+}
+
+func TestPushChartsClassic(t *testing.T) {
+	redis := chartTgz(t, "redis", "1.0.0", "cache")
+	nginx := chartTgz(t, "nginx", "2.0.0", "web")
+	podinfo := chartTgz(t, "podinfo", "6.0.0", "demo")
+
+	// redis comes from two source repos with identical bytes, so it goes up
+	// once. podinfo is an OCI chart and goes up as a plain .tgz.
+	dir, idx := newChartStore(t,
+		map[string][]byte{
+			"bitnami/redis-1.0.0.tgz": redis,
+			"mirror/redis-1.0.0.tgz":  redis,
+			"bitnami/nginx-2.0.0.tgz": nginx,
+		},
+		map[string][]byte{"ghcr.io/org/charts/podinfo:6.0.0": podinfo},
+	)
+
+	t.Setenv("GAPPY_USER", "svc")
+	t.Setenv("GAPPY_PASS", "tok")
+	fa, base := newFakeArtifactory(t, "svc", "tok")
+	fa.files["nginx-2.0.0.tgz"] = nginx
+
+	// The URL `helm repo add` takes, which push must turn into the deploy URL.
+	target, err := parseChartTarget(base + "/artifactory/api/helm/dev-helm")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	charts, problems := collectCharts(dir, idx)
+	if len(charts) != 3 || len(problems) != 0 {
+		t.Fatalf("collected %d chart(s), problems %v; want 3, none", len(charts), problems)
+	}
+
+	pushed, existed, failed := pushCharts(charts, target)
+	if pushed != 2 || existed != 1 || len(failed) != 0 {
+		t.Fatalf("pushed %d, existed %d, failed %v; want 2, 1, none", pushed, existed, failed)
+	}
+	for file, want := range map[string][]byte{"redis-1.0.0.tgz": redis, "podinfo-6.0.0.tgz": podinfo} {
+		if !bytes.Equal(fa.files[file], want) {
+			t.Fatalf("%s not deployed intact", file)
+		}
+	}
+
+	// A rerun finds everything already there and uploads nothing.
+	pushed, existed, failed = pushCharts(charts, target)
+	if pushed != 0 || existed != 3 || len(failed) != 0 || fa.puts != 2 {
+		t.Fatalf("rerun pushed %d, existed %d, failed %v, puts %d; want 0, 3, none, 2", pushed, existed, failed, fa.puts)
+	}
+}
+
+func TestPushChartsRefusesConflicts(t *testing.T) {
+	// Two source repos disagree about redis-1.0.0, so neither is pushed.
+	dir, idx := newChartStore(t, map[string][]byte{
+		"a/redis-1.0.0.tgz": chartTgz(t, "redis", "1.0.0", "from a"),
+		"b/redis-1.0.0.tgz": chartTgz(t, "redis", "1.0.0", "from b"),
+		"a/nginx-2.0.0.tgz": chartTgz(t, "nginx", "2.0.0", "ours"),
+	}, nil)
+
+	charts, problems := collectCharts(dir, idx)
+	if len(charts) != 1 || len(problems) != 1 || !strings.Contains(problems[0], "redis-1.0.0.tgz differs") {
+		t.Fatalf("collected %d chart(s), problems %v; want nginx only and one redis conflict", len(charts), problems)
+	}
+
+	// The repo already holds a different nginx-2.0.0, which must not be
+	// overwritten.
+	t.Setenv("GAPPY_USER", "svc")
+	t.Setenv("GAPPY_PASS", "tok")
+	fa, base := newFakeArtifactory(t, "svc", "tok")
+	theirs := chartTgz(t, "nginx", "2.0.0", "theirs")
+	fa.files["nginx-2.0.0.tgz"] = theirs
+
+	target, err := parseChartTarget(base + "/artifactory/dev-helm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushed, existed, failed := pushCharts(charts, target)
+	if pushed != 0 || existed != 0 || len(failed) != 1 {
+		t.Fatalf("pushed %d, existed %d, failed %v; want one failure", pushed, existed, failed)
+	}
+	if !bytes.Equal(fa.files["nginx-2.0.0.tgz"], theirs) {
+		t.Fatal("existing nginx-2.0.0.tgz was overwritten")
+	}
+}
+
+func TestPushChartsOCI(t *testing.T) {
+	redis := chartTgz(t, "redis", "1.0.0+build.1", "cache")
+	podinfo := chartTgz(t, "podinfo", "6.0.0", "demo")
+	dir, idx := newChartStore(t,
+		map[string][]byte{"bitnami/redis-1.0.0+build.1.tgz": redis},
+		map[string][]byte{"ghcr.io/org/charts/podinfo:6.0.0": podinfo},
+	)
+
+	srv := httptest.NewServer(registry.New())
+	t.Cleanup(srv.Close)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	target, err := parseChartTarget("oci://" + host + "/dev-helm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.nameOpts = []name.Option{name.Insecure}
+
+	charts, problems := collectCharts(dir, idx)
+	if len(problems) != 0 {
+		t.Fatal(problems)
+	}
+	pushed, existed, failed := pushCharts(charts, target)
+	if pushed != 2 || existed != 0 || len(failed) != 0 {
+		t.Fatalf("pushed %d, existed %d, failed %v; want 2, 0, none", pushed, existed, failed)
+	}
+
+	// The .tgz chart arrives as a Helm OCI artifact. Its tag spells "+" as "_".
+	ref, err := name.ParseReference(host+"/dev-helm/redis:1.0.0_build.1", name.Insecure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := remote.Image(ref)
+	if err != nil {
+		t.Fatalf("redis chart missing: %v", err)
+	}
+	m, err := img.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Config.MediaType != helmConfigMediaType || len(m.Layers) != 1 || m.Layers[0].MediaType != helmChartMediaType {
+		t.Fatalf("manifest is not a Helm chart: config %s, layers %v", m.Config.MediaType, m.Layers)
+	}
+	s256 := sha256.Sum256(redis)
+	if m.Layers[0].Digest.Hex != hex.EncodeToString(s256[:]) {
+		t.Fatal("chart layer is not the .tgz byte for byte")
+	}
+	raw, err := img.RawConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta struct{ Name, Version string }
+	if err := json.Unmarshal(raw, &meta); err != nil || meta.Name != "redis" || meta.Version != "1.0.0+build.1" {
+		t.Fatalf("config = %s, want redis 1.0.0+build.1", raw)
+	}
+
+	// The OCI chart goes over as packed, with its digest unchanged.
+	want := descriptorForRef(t, layout.Path(dir), "ghcr.io/org/charts/podinfo:6.0.0").Digest
+	got, err := crane.Digest(host+"/dev-helm/podinfo:6.0.0", crane.Insecure)
+	if err != nil || got != want.String() {
+		t.Fatalf("podinfo digest = %s (%v), want %s", got, err, want)
+	}
+
+	pushed, existed, failed = pushCharts(charts, target)
+	if pushed != 0 || existed != 2 || len(failed) != 0 {
+		t.Fatalf("rerun pushed %d, existed %d, failed %v; want 0, 2, none", pushed, existed, failed)
+	}
+}
+
+func TestPushStoreSkipsCharts(t *testing.T) {
+	_, idx := newChartStore(t, nil, map[string][]byte{
+		"ghcr.io/org/charts/podinfo:6.0.0": chartTgz(t, "podinfo", "6.0.0", "demo"),
+	})
+	srv := httptest.NewServer(registry.New())
+	t.Cleanup(srv.Close)
+	prefix := strings.TrimPrefix(srv.URL, "http://") + "/dev-docker"
+
+	// With --helm the chart goes to the Helm repo, so only the image is pushed.
+	pushed, failed, err := pushStore(idx, prefix, true, []name.Option{name.Insecure})
+	if err != nil || pushed != 1 || len(failed) != 0 {
+		t.Fatalf("pushed %d, failed %v, err %v; want the image only", pushed, failed, err)
+	}
+	if _, err := crane.Digest(prefix+"/ghcr.io/org/charts/podinfo:6.0.0", crane.Insecure); err == nil {
+		t.Fatal("chart was pushed to the image registry")
+	}
+
+	pushed, _, err = pushStore(idx, prefix, false, []name.Option{name.Insecure})
+	if err != nil || pushed != 2 {
+		t.Fatalf("without skipCharts pushed %d, err %v; want 2", pushed, err)
+	}
+}
+
+func TestParseChartTarget(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://art.example.com/artifactory/api/helm/dev-helm": "https://art.example.com/artifactory/dev-helm",
+		"https://art.example.com/artifactory/dev-helm/":         "https://art.example.com/artifactory/dev-helm",
+		"https://u:secret@art.example.com/artifactory/dev-helm": "https://art.example.com/artifactory/dev-helm",
+		"oci://art.example.com/dev-helm/":                       "oci://art.example.com/dev-helm",
+	} {
+		target, err := parseChartTarget(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if got := target.String(); got != want {
+			t.Fatalf("%s → %s, want %s", raw, got, want)
+		}
+	}
+	for _, raw := range []string{"art.example.com/dev-helm", "ftp://art.example.com/dev-helm"} {
+		if _, err := parseChartTarget(raw); err == nil {
+			t.Fatalf("%s: want an error", raw)
+		}
+	}
 }
 
 // --- build info ------------------------------------------------------------
